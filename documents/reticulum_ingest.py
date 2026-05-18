@@ -350,7 +350,6 @@ def record_telemetry(device_id: str, readings: dict, battery_v: Optional[float] 
             "SELECT node_id FROM sensor_nodes WHERE node_id = ?", (node_id,)
         ).fetchone()
         if not existing:
-            # Try to derive a human-readable name from the device_id
             node_name = {
                 "SN-SOIL-01": "Soil Sensor 1",
                 "SN-AIR-01": "Air Sensor 1",
@@ -360,9 +359,8 @@ def record_telemetry(device_id: str, readings: dict, battery_v: Optional[float] 
                 (node_id, node_name),
             )
             conn.commit()
-            RNS.log(f"[DB] Auto-provisioned sensor_nodes for {device_id}", RNS.LOG_INFO)
+            RNS.log(f"[DB] Provisioned sensor_nodes for {device_id}", RNS.LOG_INFO)
 
-        # Auto-provision hardware_devices if not present
         hw_existing = conn.execute(
             "SELECT device_id FROM hardware_devices WHERE device_id = ?", (device_id,)
         ).fetchone()
@@ -372,7 +370,7 @@ def record_telemetry(device_id: str, readings: dict, battery_v: Optional[float] 
                 "SN-AIR-01": "air_node",
                 "AN-PUMP-01": "pump_node",
                 "AN-GREENHOUSE-01": "gh_actuator",
-            }.get(device_id, "soil_node")  # default fallback
+            }.get(device_id, "soil_node")
             conn.execute(
                 """INSERT OR IGNORE INTO hardware_devices
                    (device_id, device_type, node_id, firmware_version, status)
@@ -380,9 +378,7 @@ def record_telemetry(device_id: str, readings: dict, battery_v: Optional[float] 
                 (device_id, device_type, device_id),
             )
             conn.commit()
-            RNS.log(
-                f"[DB] Auto-provisioned hardware_devices for {device_id}", RNS.LOG_INFO
-            )
+            RNS.log(f"[DB] Provisioned hardware_devices for {device_id}", RNS.LOG_INFO)
 
         conn.execute(
             "UPDATE sensor_nodes SET last_seen = ? WHERE node_id = ?", (now, node_id)
@@ -542,15 +538,6 @@ class TelemetryDestination:
         RNS.log(f"[RNS] Announced on network — gateways will discover automatically")
 
     def on_packet(self, data: bytes, packet: RNS.Packet):
-        RNS.log(f"[RNS] PACKET RECEIVED on telemetry! {len(data)} bytes", RNS.LOG_INFO)
-        RNS.log(
-            f"[RNS] Packet destination hash: {RNS.prettyhexrep(packet.destination_hash)}",
-            RNS.LOG_DEBUG,
-        )
-        RNS.log(f"[RNS] Packet type: {packet.packet_type}", RNS.LOG_DEBUG)
-        RNS.log(
-            f"[RNS] Receiving interface: {packet.receiving_interface}", RNS.LOG_DEBUG
-        )
         try:
             payload = json.loads(data.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -563,28 +550,17 @@ class TelemetryDestination:
         gateway_id = payload.get("gateway_id", "unknown")
 
         if not device_id:
-            RNS.log(
-                f"[WARN] Malformed telemetry (no dev_id): {payload}", RNS.LOG_WARNING
-            )
+            RNS.log("[WARN] Telemetry packet with no dev_id, dropped", RNS.LOG_WARNING)
             return
 
         if not readings:
-            # No sensor readings — skip entirely. These come from sensor
-            # wake cycles where the DHT22 failed to stabilize.
-            # We don't want empty rows in the DB or noisy log spam.
-            RNS.log(
-                f"[TELEMETRY] {device_id} via {gateway_id}: no readings, dropped",
-                RNS.LOG_DEBUG,
-            )
+            # DHT22 stabilization failure — skip silently
             return
 
-        RNS.log(f"[TELEMETRY] {device_id} via {gateway_id}: {readings}", RNS.LOG_INFO)
-        if battery_v is not None:
-            RNS.log(f"[TELEMETRY] {device_id} battery: {battery_v}V", RNS.LOG_INFO)
+        RNS.log(f"[TELEMETRY] {device_id}: {readings}", RNS.LOG_INFO)
 
         try:
             record_telemetry(device_id, readings, battery_v)
-            RNS.log(f"[TELEMETRY] {device_id} written to DB", RNS.LOG_INFO)
         except Exception as e:
             RNS.log(f"[ERROR] DB write failed for {device_id}: {e}", RNS.LOG_ERROR)
             return
@@ -593,8 +569,8 @@ class TelemetryDestination:
         if rssi is not None:
             try:
                 log_ble_meta(device_id, gateway_id, int(rssi))
-            except Exception as e:
-                RNS.log(f"[WARN] BLE meta log failed: {e}", RNS.LOG_WARNING)
+            except Exception:
+                pass
 
 
 class CommandAckDestination:
@@ -754,8 +730,8 @@ class GatewayAnnounceHandler:
                 )
                 conn.commit()
                 RNS.log(
-                    f"[GW-DISCOV] Gateway {gateway_id} announced ({dest_hash_hex})",
-                    RNS.LOG_INFO,
+                    f"[GW-DISCOV] Gateway {gateway_id} announced",
+                    RNS.LOG_DEBUG,
                 )
         except Exception as e:
             RNS.log(f"[GW-DISCOV] DB update failed: {e}", RNS.LOG_ERROR)
