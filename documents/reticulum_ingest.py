@@ -407,7 +407,10 @@ def record_telemetry(device_id: str, readings: dict, battery_v: Optional[float] 
             )
         conn.commit()
 
-    RNS.log(f"[DB] {len(all_readings)} readings from {device_id}", RNS.LOG_DEBUG)
+    if all_readings:
+        RNS.log(f"[DB] {len(all_readings)} readings from {device_id}", RNS.LOG_INFO)
+    else:
+        RNS.log(f"[DB] {device_id} heartbeat (no readings)", RNS.LOG_INFO)
 
 
 def _get_unit(reading_type: str) -> str:
