@@ -568,13 +568,13 @@ class TelemetryDestination:
             )
             return
 
-        # Empty readings dict is valid — sensor may send metadata-only packets
-        # (e.g. deep-sleep wakeups where sensor read failed).
-        # Only reject if readings key is missing entirely.
-        if readings is None:
+        if not readings:
+            # No sensor readings — skip entirely. These come from sensor
+            # wake cycles where the DHT22 failed to stabilize.
+            # We don't want empty rows in the DB or noisy log spam.
             RNS.log(
-                f"[WARN] Malformed telemetry (no readings key): {payload}",
-                RNS.LOG_WARNING,
+                f"[TELEMETRY] {device_id} via {gateway_id}: no readings, dropped",
+                RNS.LOG_DEBUG,
             )
             return
 
