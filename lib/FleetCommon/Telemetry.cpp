@@ -1,5 +1,6 @@
 #include "Telemetry.h"
 #include <ArduinoJson.h>
+#include "esp_mac.h"
 
 String Telemetry::buildJson(const SensorReading& r, const char* deviceId, uint32_t bootCount) {
     JsonDocument doc;
@@ -7,6 +8,15 @@ String Telemetry::buildJson(const SensorReading& r, const char* deviceId, uint32
     doc["ts"] = (uint32_t)(esp_timer_get_time() / 1000000ULL);
     doc["fw_ver"] = FIRMWARE_VERSION;
     doc["seq"] = bootCount;
+
+    // Auto-provisioning: device self-identifies its type and BLE MAC
+    doc["device_type"] = DEVICE_TYPE;
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_BT);
+    char mac_str[18];
+    snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    doc["ble_mac"] = mac_str;
 
 #if HAS_BAT_RESISTORS
     doc["bat_v"] = serialized(String(r.batteryV, 2));

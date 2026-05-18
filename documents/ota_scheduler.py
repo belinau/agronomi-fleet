@@ -24,8 +24,8 @@ import RNS
 # CONFIGURATION — adjust these for your deployment
 # ---------------------------------------------------------------------------
 
-OTA_WINDOW_START = 2  # 02:00 local time
-OTA_WINDOW_END = 4  # 04:00 local time
+OTA_WINDOW_START = 21  # 21:00 local time
+OTA_WINDOW_END = 24  # midnight — extended for testing
 OTA_MAX_RETRIES = 3  # per node per night
 OTA_RETRY_BACKOFF = [60, 180, 420]  # seconds: 1min, 3min, 7min
 
@@ -37,7 +37,7 @@ OTA_CURRENT_FW = {
         "/var/agronomi/fw/soil_node_1.3.0.bin",
         "placeholder_sha256",
     ),
-    "air_node": ("1.3.0", "/var/agronomi/fw/air_node_1.3.0.bin", "placeholder_sha256"),
+    "air_node": ("1.4.0", "/var/agronomi/fw/air_node_1.4.0.bin", "placeholder_sha256"),
 }
 
 # RNS Link establishment timeout for OTA Resource transfer
@@ -263,7 +263,12 @@ PATH_REQUEST_RETRY_DELAY = 2  # seconds
 
 
 def dispatch_ota(
-    conn, cmd_id: int, device_id: str, cmd_value_text: str, gw_hash_hex: str
+    conn,
+    cmd_id: int,
+    device_id: str,
+    cmd_value_text: str,
+    gw_hash_hex: str,
+    ble_mac: str | None = None,
 ):
     """Dispatch an ota_request command to a gateway via RNS Link + Resource.
 
@@ -404,24 +409,50 @@ def dispatch_ota(
                     "device_type": dtype,
                     "sha256": sha256 or actual_sha,
                     "size_bytes": len(firmware_data),
+                    "ble_mac": ble_mac,
                     "ts": int(time.time()),
                 }
             ).encode("utf-8")
             pkt = RNS.Packet(gw_dest, payload)
             pkt.send()
-            conn.execute(
-                "UPDATE actuator_commands SET status='sent', last_retry_at=datetime('now') "
-                "WHERE cmd_id=?",
-                (cmd_id,),
-            )
-            conn.commit()
+            # Use a fresh DB connection — RNS callbacks run on a
+            # different thread than the one that created `conn`.
+            try:
+                with _get_conn() as cb_conn:
+                    cb_conn.execute(
+                        "UPDATE actuator_commands SET status='sent', last_retry_at=datetime('now') "
+                        "WHERE cmd_id=?",
+                        (cmd_id,),
+                    )
+                    cb_conn.commit()
+            except Exception as e:
+                RNS.log(
+                    f"[OTA] DB update failed after delivery for cmd {cmd_id}: {e}",
+                    RNS.LOG_ERROR,
+                )
         else:
             RNS.log(f"[OTA] Resource transfer failed for cmd {cmd_id}", RNS.LOG_ERROR)
-            _mark_ota_failed(conn, cmd_id, "Resource transfer incomplete")
+            # Use a fresh DB connection for the same thread-safety reason.
+            try:
+                with _get_conn() as cb_conn:
+                    _mark_ota_failed(cb_conn, cmd_id, "Resource transfer incomplete")
+            except Exception as e:
+                RNS.log(f"[OTA] DB update failed for cmd {cmd_id}: {e}", RNS.LOG_ERROR)
         link.teardown()
 
-    resource = RNS.Resource(firmware_data, link, callback=on_resource_concluded)
-    resource.advertise()
+    # Calculate a generous timeout for LoRa transfer:
+    # At VERY_SLOW rate (250 B/s), 1.4MB takes ~5700s (~95min).
+    # Use 7200s (2h) as a safe upper bound for large firmware over LoRa.
+    ota_timeout = 7200
+    RNS.log(
+        f"[OTA] Transfer timeout: {ota_timeout}s for {len(firmware_data)} bytes",
+        RNS.LOG_INFO,
+    )
+
+    resource = RNS.Resource(
+        firmware_data, link, callback=on_resource_concluded, timeout=ota_timeout
+    )
+    # advertise=True is the default, so no separate call needed
 
 
 def _mark_ota_failed(conn, cmd_id: int, reason: str):

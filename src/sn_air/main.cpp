@@ -16,10 +16,10 @@ DHT dht(PIN_DHT, DHT22);
 RTC_DATA_ATTR uint32_t bootCount = 0;
 BLEManager bleManager;
 OTAManager otaManager;
-OTAManager* otaManagerPtr = nullptr;
+
 
 void onActuatorCommand(const char* cmd_type, float cmd_value, int cmd_id) {
-    Serial.printf("[CMD] Received: type=%s value=%.2f id=%d\n", cmd_type, cmd_value, cmd_id);
+    Serial.printf("[CMD] Received: type=%s value=%.2f id=%d (fw=%s)\n", cmd_type, cmd_value, cmd_id, FIRMWARE_VERSION);
 
     if (strcmp(cmd_type, "vent_open") == 0) {
         // TODO: Open vent actuator
@@ -97,8 +97,15 @@ void setup() {
     bootCount++;
 
     Serial.println("========================================");
-    Serial.printf("BOOT %u | Device: %s\n", bootCount, DEVICE_ID);
+    Serial.printf("BOOT %u | Device: %s | FW: %s\n", bootCount, DEVICE_ID, FIRMWARE_VERSION);
     Serial.println("========================================");
+
+    // Wake reason & heap for deep-sleep / OTA diagnostics
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+    Serial.printf("[SYS] Wake: %s | Heap: %u\n",
+        wakeup_reason == ESP_SLEEP_WAKEUP_TIMER ? "TIMER" :
+        wakeup_reason == ESP_SLEEP_WAKEUP_EXT0  ? "EXT0"  : "PWRON",
+        ESP.getFreeHeap());
 
     SensorReading r = readSensors();
 
@@ -106,7 +113,7 @@ void setup() {
     bleManager.begin(DEVICE_ID, GATEWAY_NAME);
     bleManager.setCommandCallback(onActuatorCommand);
     bleManager.setOtaManager(&otaManager);
-    otaManagerPtr = &otaManager;
+
 
     if (bleManager.runDiagnostics()) {
         delay(1000);

@@ -53,3 +53,7 @@ test_pipeline/test_farm.db*
 
 # --- OTA firmware cache (runtime) ---
 fw_cache/
+.gitnexus
+.claude/skills/gitnexus/
+AGENTS.md
+CLAUDE.md

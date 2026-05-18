@@ -429,11 +429,11 @@ class GatewayCommandReceiver:
         resource callback to receive the binary data.
         """
         RNS.log(
-            f"[CMD] Link established from {RNS.prettyhexrep(link.destination_hash)}",
+            f"[CMD] Link established from {RNS.prettyhexrep(link.destination.hash)}",
             RNS.LOG_INFO,
         )
         link.set_resource_strategy(RNS.Link.ACCEPT_ALL)
-        link.set_resource_callback(self._on_resource)
+        link.set_resource_concluded_callback(self._on_resource)
 
     def _on_resource(self, resource):
         """Called when an RNS Resource transfer is concluded.
@@ -561,15 +561,29 @@ class GatewayCommandReceiver:
             return
 
         # Run BLE OTA in a new event loop (since we're in a sync context)
+        # Use the telemetry sender to send ACK back to hub via RNS
+        # (creates an OUT SINGLE destination to farm.commands_control)
+        def send_ota_ack(
+            cmd_id: int, status: str, fw_version: str = None, error: str = None
+        ):
+            ack_payload = {"cmd_id": cmd_id, "status": status}
+            if fw_version:
+                ack_payload["fw_version"] = fw_version
+            if error:
+                ack_payload["error"] = error
+            ack_payload["gateway_id"] = self.gateway_id
+            self._telemetry_sender.send_ack(ack_payload)
+
         try:
             loop = asyncio.new_event_loop()
             loop.run_until_complete(
                 handle_ota_command(
-                    rns_hub_dest=None,  # ACK sent via serial/RNS later
+                    rns_hub_dest=None,
                     cmd=cmd,
                     firmware_data=firmware_data,
                     gateway_id=self.gateway_id,
                     config=self._config,
+                    send_ack_fn=send_ota_ack,
                 )
             )
             loop.close()

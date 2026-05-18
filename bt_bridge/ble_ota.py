@@ -41,13 +41,20 @@ NUS_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  # gateway writes to C6
 NUS_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  # C6 notifies to gateway
 
 
-def get_ble_mac(device_id: str, config: dict) -> str | None:
-    """Look up the BLE MAC address for a device from the gateway config.
+def get_ble_mac(device_id: str, config: dict, cmd: dict | None = None) -> str | None:
+    """Look up the BLE MAC address for a device.
 
-    In production this would query a local DB snapshot or config file.
-    For now, we use a hardcoded mapping that should be updated per deployment.
+    Priority:
+    1. The ble_mac field in the command payload (sent by hub from DB)
+    2. The gateway's local ble_mac_map config
     """
-    # TODO: Replace with DB query or config-driven mapping
+    # Hub-provided MAC takes priority (comes from DB, always up-to-date)
+    if cmd and cmd.get("ble_mac"):
+        mac = cmd["ble_mac"]
+        if mac and not mac.startswith("AA:BB:CC"):  # skip placeholder MACs
+            return mac
+
+    # Fallback to local config map
     ble_map = config.get("ble_mac_map", {})
     return ble_map.get(device_id)
 
@@ -77,12 +84,18 @@ async def handle_ota_command(
     )
     cmd_id = cmd.get("cmd_id", -1)
 
-    ble_mac = get_ble_mac(device_id, config)
+    ble_mac = get_ble_mac(device_id, config, cmd)
     if not ble_mac:
         RNS.log(f"[OTA] No BLE MAC for {device_id} — cannot flash", RNS.LOG_ERROR)
-        _send_rns_ack(
-            rns_hub_dest, cmd_id, status="failed", error=f"No BLE MAC for {device_id}"
-        )
+        if send_ack_fn:
+            send_ack_fn(cmd_id, status="failed", error=f"No BLE MAC for {device_id}")
+        else:
+            _send_rns_ack(
+                rns_hub_dest,
+                cmd_id,
+                status="failed",
+                error=f"No BLE MAC for {device_id}",
+            )
         return
 
     for attempt in range(1, OTA_MAX_BLE_RETRIES + 1):
@@ -96,9 +109,12 @@ async def handle_ota_command(
             RNS.log(
                 f"[OTA] {device_id} flashed successfully → {fw_version}", RNS.LOG_INFO
             )
-            _send_rns_ack(
-                rns_hub_dest, cmd_id, status="acknowledged", fw_version=fw_version
-            )
+            if send_ack_fn:
+                send_ack_fn(cmd_id, status="acknowledged", fw_version=fw_version)
+            else:
+                _send_rns_ack(
+                    rns_hub_dest, cmd_id, status="acknowledged", fw_version=fw_version
+                )
             return
 
         RNS.log(
@@ -114,12 +130,19 @@ async def handle_ota_command(
     RNS.log(
         f"[OTA] {device_id} failed after {OTA_MAX_BLE_RETRIES} attempts", RNS.LOG_ERROR
     )
-    _send_rns_ack(
-        rns_hub_dest,
-        cmd_id,
-        status="failed",
-        error=f"BLE OTA failed after {OTA_MAX_BLE_RETRIES} attempts: {error}",
-    )
+    if send_ack_fn:
+        send_ack_fn(
+            cmd_id,
+            status="failed",
+            error=f"BLE OTA failed after {OTA_MAX_BLE_RETRIES} attempts: {error}",
+        )
+    else:
+        _send_rns_ack(
+            rns_hub_dest,
+            cmd_id,
+            status="failed",
+            error=f"BLE OTA failed after {OTA_MAX_BLE_RETRIES} attempts: {error}",
+        )
 
 
 async def _ble_ota_attempt(ble_mac: str, firmware: bytes, fw_version: str) -> tuple:

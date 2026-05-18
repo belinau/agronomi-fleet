@@ -238,7 +238,7 @@ CREATE TABLE IF NOT EXISTS actuator_commands (
     executed_at     TEXT,
     status          TEXT DEFAULT 'pending'
                     CHECK(status IN
-                        ('pending','sent','acknowledged','failed','expired')),
+                        ('pending','transferring','sent','acknowledged','failed','expired')),
     retry_count     INTEGER DEFAULT 0,
     last_retry_at   TEXT,
     error_message   TEXT
@@ -298,9 +298,12 @@ def _migrate_schema(conn: sqlite3.Connection):
     row = cursor.fetchone()
     if row and row[0]:
         schema_sql = row[0]
-        if "ota_request" not in schema_sql:
+        needs_rebuild = (
+            "ota_request" not in schema_sql or "transferring" not in schema_sql
+        )
+        if needs_rebuild:
             RNS.log(
-                "[DB] Rebuilding actuator_commands with expanded cmd_type constraint",
+                "[DB] Rebuilding actuator_commands with expanded constraints",
                 RNS.LOG_INFO,
             )
             # Full table rebuild to update CHECK constraint
@@ -318,7 +321,7 @@ def _migrate_schema(conn: sqlite3.Connection):
                     executed_at     TEXT,
                     status          TEXT DEFAULT 'pending'
                                     CHECK(status IN
-                                        ('pending','sent','acknowledged','failed','expired')),
+                                        ('pending','transferring','sent','acknowledged','failed','expired')),
                     retry_count     INTEGER DEFAULT 0,
                     last_retry_at   TEXT,
                     error_message   TEXT
@@ -335,7 +338,15 @@ def _migrate_schema(conn: sqlite3.Connection):
     conn.commit()
 
 
-def record_telemetry(device_id: str, readings: dict, battery_v: Optional[float] = None):
+def record_telemetry(
+    device_id: str,
+    readings: dict,
+    battery_v: Optional[float] = None,
+    ble_mac: Optional[str] = None,
+    device_type: Optional[str] = None,
+    fw_ver: Optional[str] = None,
+    gateway_id: Optional[str] = None,
+):
     """Write parsed sensor readings into sensor_readings table."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_db() as conn:
@@ -367,17 +378,25 @@ def record_telemetry(device_id: str, readings: dict, battery_v: Optional[float] 
             "SELECT device_id FROM hardware_devices WHERE device_id = ?", (device_id,)
         ).fetchone()
         if not hw_existing:
-            device_type = {
+            resolved_device_type = device_type or {
                 "SN-SOIL-01": "soil_node",
                 "SN-AIR-01": "air_node",
                 "AN-PUMP-01": "pump_node",
                 "AN-GREENHOUSE-01": "gh_actuator",
-            }.get(device_id, "soil_node")  # default fallback
+            }.get(device_id, "soil_node")
             conn.execute(
                 """INSERT OR IGNORE INTO hardware_devices
-                   (device_id, device_type, node_id, firmware_version, status)
-                   VALUES (?, ?, ?, '0.0.0', 'active')""",
-                (device_id, device_type, device_id),
+                   (device_id, device_type, node_id, firmware_version,
+                    ble_mac, ble_target_gateway, status)
+                   VALUES (?, ?, ?, ?, ?, ?, 'active')""",
+                (
+                    device_id,
+                    resolved_device_type,
+                    device_id,
+                    fw_ver or "0.0.0",
+                    ble_mac,
+                    gateway_id if gateway_id and gateway_id != "unknown" else None,
+                ),
             )
             conn.commit()
             RNS.log(
@@ -391,6 +410,46 @@ def record_telemetry(device_id: str, readings: dict, battery_v: Optional[float] 
             "UPDATE hardware_devices SET last_seen = ? WHERE device_id = ?",
             (now, device_id),
         )
+
+        # Enrich existing hardware_devices with auto-discovered fields
+        enrich_parts = []
+        enrich_params = []
+        if ble_mac:
+            cur = conn.execute(
+                "SELECT ble_mac FROM hardware_devices WHERE device_id = ? AND (ble_mac IS NULL OR ble_mac LIKE 'AA:BB:CC%')",
+                (device_id,),
+            ).fetchone()
+            if cur:
+                enrich_parts.append("ble_mac = ?")
+                enrich_params.append(ble_mac)
+        if fw_ver:
+            cur = conn.execute(
+                "SELECT firmware_version FROM hardware_devices WHERE device_id = ? AND (firmware_version IS NULL OR firmware_version = '0.0.0')",
+                (device_id,),
+            ).fetchone()
+            if cur:
+                enrich_parts.append("firmware_version = ?")
+                enrich_params.append(fw_ver)
+        if gateway_id and gateway_id != "unknown":
+            cur = conn.execute(
+                "SELECT ble_target_gateway FROM hardware_devices WHERE device_id = ? AND ble_target_gateway IS NULL",
+                (device_id,),
+            ).fetchone()
+            if cur:
+                enrich_parts.append("ble_target_gateway = ?")
+                enrich_params.append(gateway_id)
+        if enrich_parts:
+            enrich_params.append(device_id)
+            set_clause = ", ".join(enrich_parts)
+            conn.execute(
+                f"UPDATE hardware_devices SET {set_clause} WHERE device_id = ?",
+                enrich_params,
+            )
+            conn.commit()
+            RNS.log(
+                f"[DB] Enriched {device_id}: {set_clause}",
+                RNS.LOG_INFO,
+            )
 
         # Insert battery_v as its own reading if provided
         all_readings = dict(readings)
@@ -561,6 +620,9 @@ class TelemetryDestination:
         readings = payload.get("readings", {})
         battery_v = payload.get("bat_v")
         gateway_id = payload.get("gateway_id", "unknown")
+        ble_mac = payload.get("ble_mac")
+        device_type = payload.get("device_type")
+        fw_ver = payload.get("fw_ver")
 
         if not device_id:
             RNS.log(
@@ -583,7 +645,15 @@ class TelemetryDestination:
             RNS.log(f"[TELEMETRY] {device_id} battery: {battery_v}V", RNS.LOG_INFO)
 
         try:
-            record_telemetry(device_id, readings, battery_v)
+            record_telemetry(
+                device_id,
+                readings,
+                battery_v,
+                ble_mac=ble_mac,
+                device_type=device_type,
+                fw_ver=fw_ver,
+                gateway_id=gateway_id,
+            )
             RNS.log(f"[TELEMETRY] {device_id} written to DB", RNS.LOG_INFO)
         except Exception as e:
             RNS.log(f"[ERROR] DB write failed for {device_id}: {e}", RNS.LOG_ERROR)
@@ -841,12 +911,28 @@ class CommandDispatcher:
                         f"[OTA] Dispatching OTA cmd {cmd_id} for {device_id}",
                         RNS.LOG_INFO,
                     )
+                    # Mark as 'transferring' immediately so the dispatcher
+                    # doesn't re-dispatch the same cmd on the next poll.
+                    conn.execute(
+                        "UPDATE actuator_commands SET status='transferring' WHERE cmd_id=?",
+                        (cmd_id,),
+                    )
+                    conn.commit()
+
+                    # Look up BLE MAC for the target device
+                    ble_mac_row = conn.execute(
+                        "SELECT ble_mac FROM hardware_devices WHERE device_id = ?",
+                        (device_id,),
+                    ).fetchone()
+                    ble_mac = ble_mac_row["ble_mac"] if ble_mac_row else None
+
                     dispatch_ota(
                         conn,
                         cmd_id,
                         device_id,
                         cmd_value_text,
                         gw_row["rns_destination_hash"],
+                        ble_mac,
                     )
                     continue
 
@@ -867,12 +953,21 @@ class CommandDispatcher:
                     continue
 
                 dest_hash_hex = gw_row["rns_destination_hash"]
+
+                # Look up BLE MAC for the target device
+                ble_mac_row = conn.execute(
+                    "SELECT ble_mac FROM hardware_devices WHERE device_id = ?",
+                    (device_id,),
+                ).fetchone()
+                ble_mac = ble_mac_row["ble_mac"] if ble_mac_row else None
+
                 payload = json.dumps(
                     {
                         "cmd_id": cmd_id,
                         "device_id": device_id,
                         "cmd_type": cmd_type,
                         "cmd_value": row["cmd_value"],
+                        "ble_mac": ble_mac,
                         "ts": int(time.time()),
                     }
                 ).encode("utf-8")
