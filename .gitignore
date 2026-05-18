@@ -1,0 +1,55 @@
+# ============================================================
+# AgroNomi Pod Peripherals — Git Ignore
+# ============================================================
+
+# --- Build artifacts (PlatformIO) ---
+.pio/
+
+# --- Databases (runtime data, never commit) ---
+*.db
+*.db-shm
+*.db-wal
+
+# --- Identity / secrets (private keys) ---
+*.identity
+farm_hub.identity
+gateway.identity
+
+# --- Python bytecode ---
+__pycache__/
+*.pyc
+*.pyo
+
+# --- Python virtual environments ---
+.venv/
+venv/
+
+# --- Reticulum storage cache (runtime) ---
+.reticulum/
+storage/
+
+# --- Firmware binaries ---
+*.bin
+*.uf2
+*.hex
+
+# --- Logs ---
+agronomi.log
+*.log
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Sensor test/dev data ---
+test_pipeline/test_farm.db*
+
+# --- OTA firmware cache (runtime) ---
+fw_cache/

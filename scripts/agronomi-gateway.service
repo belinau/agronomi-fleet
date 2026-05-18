@@ -1,0 +1,19 @@
+[Unit]
+Description=AgroNomi Field Gateway — BLE Forwarder
+After=network.target reticulum.service
+Requires=reticulum.service
+
+[Service]
+Type=simple
+User=livada
+WorkingDirectory=/home/livada/CascadeProjects/ble_forwarder
+ExecStart=/home/livada/CascadeProjects/ble_forwarder/agronomi-gateway-wrapper.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal+console
+StandardError=journal+console
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/livada/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
