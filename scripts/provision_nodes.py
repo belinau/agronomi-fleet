@@ -1,20 +1,34 @@
 #!/usr/bin/env python3
 """Provision the AgroNomi database with sensor nodes, hardware devices, and gateways.
 
-This script idempotently inserts the baseline fleet of nodes, devices, and the
-LoRa gateway into the AgroNomi SQLite database.  It uses ``INSERT OR IGNORE``
-so it can be safely re-run without duplicating rows.
+RNS-native provisioning script for the AgroNomi fleet database.  All BLE-era
+artefacts (``ble_mac``, ``ble_target_gateway``, hardcoded LoRa radio params)
+have been removed in favour of announce-based auto-discovery.
+
+**Key design points**
+
+* RNS identity hashes (``rns_identity_hash``) and destination hashes
+  (``rns_destination_hash``) are **auto-populated** by
+  ``GatewayAnnounceHandler`` in ``reticulum_ingest.py`` when nodes announce
+  on the RNS network — no manual entry is needed.
+* ``rns_interface`` specifies the transport layer for each device:
+  ``'ble'`` for ESP32-C6 sensors/actuators, ``'lora'`` for the RNode gateway.
+* LoRa radio parameters (``lora_frequency``, ``lora_spreading_factor``) come
+  from the RNode configuration file, **not** from the database, so they are
+  omitted from seed data.
+* ``--discover`` mode (stub) will eventually connect to a live RNS network
+  and auto-populate rows from announce packets, replacing static seeding.
 
 Usage examples::
 
-    # Default database path
+    # Default database path — idempotent static seeding
     python3 scripts/provision_nodes.py
 
     # Custom database path
     python3 scripts/provision_nodes.py --db /tmp/farm_data.db
 
-    # With a known RNS destination hash (hex string, no ``0x`` prefix)
-    python3 scripts/provision_nodes.py --gateway-rns-hash a1b2c3d4e5f67890abcdef1234567890
+    # Discover mode (stub — will auto-populate from RNS announces)
+    python3 scripts/provision_nodes.py --discover
 
     # Show current contents of all three tables
     python3 scripts/provision_nodes.py --show
@@ -23,11 +37,14 @@ Usage examples::
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sqlite3
 import sys
 from datetime import datetime, timezone
 from typing import Sequence
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Data constants
@@ -44,6 +61,16 @@ SENSOR_NODES: list[dict] = [
         "name": "Air Sensor 1",
         "location": "Field A - Weather Station",
     },
+    {
+        "node_id": "AN-PUMP-01",
+        "name": "Pump Actuator 1",
+        "location": "Field A - Irrigation",
+    },
+    {
+        "node_id": "AN-GREENHOUSE-01",
+        "name": "Greenhouse Actuator 1",
+        "location": "Greenhouse Bay 1",
+    },
 ]
 
 HARDWARE_DEVICES: list[dict] = [
@@ -51,11 +78,10 @@ HARDWARE_DEVICES: list[dict] = [
         "device_id": "SN-SOIL-01",
         "device_type": "soil_node",
         "node_id": "SN-SOIL-01",
-        "ble_mac": "AA:BB:CC:DD:EE:01",
-        "ble_target_gateway": "GW-MIMI-01",
-        "firmware_version": "1.3.0",
+        "rns_interface": "ble",
+        "firmware_version": "2.0.0-mr",
         "hardware_revision": "rev-c6-v1",
-        "battery_type": None,
+        "battery_type": "18650_liion",
         "install_date": datetime.now(tz=timezone.utc).isoformat(),
         "status": "active",
     },
@@ -63,36 +89,116 @@ HARDWARE_DEVICES: list[dict] = [
         "device_id": "SN-AIR-01",
         "device_type": "air_node",
         "node_id": "SN-AIR-01",
-        "ble_mac": "AA:BB:CC:DD:EE:02",
-        "ble_target_gateway": "GW-MIMI-01",
-        "firmware_version": "1.3.0",
+        "rns_interface": "ble",
+        "firmware_version": "2.0.0-mr",
+        "hardware_revision": "rev-c6-v1",
+        "battery_type": "18650_liion",
+        "install_date": datetime.now(tz=timezone.utc).isoformat(),
+        "status": "active",
+    },
+    {
+        "device_id": "AN-PUMP-01",
+        "device_type": "pump_node",
+        "node_id": None,  # actuators may not be in sensor_nodes table
+        "rns_interface": "ble",
+        "firmware_version": "2.0.0-mr",
         "hardware_revision": "rev-c6-v1",
         "battery_type": None,
         "install_date": datetime.now(tz=timezone.utc).isoformat(),
         "status": "active",
     },
     {
-        "device_id": "GW-MIMI-01",
+        "device_id": "AN-GREENHOUSE-01",
+        "device_type": "gh_actuator",
+        "node_id": None,
+        "rns_interface": "ble",
+        "firmware_version": "2.0.0-mr",
+        "hardware_revision": "rev-c6-v1",
+        "battery_type": None,
+        "install_date": datetime.now(tz=timezone.utc).isoformat(),
+        "status": "active",
+    },
+    {
+        "device_id": "RN-HUB-01",
         "device_type": "gateway",
         "node_id": None,
-        "ble_mac": None,
-        "ble_target_gateway": None,
-        "firmware_version": "0.1.0",
-        "hardware_revision": "pi-zero-2w",
+        "rns_interface": "lora",
+        "firmware_version": "1.86",
+        "hardware_revision": "rak4631",
+        "battery_type": None,
+        "install_date": datetime.now(tz=timezone.utc).isoformat(),
+        "status": "active",
+    },
+    {
+        "device_id": "RN-RELAY-01",
+        "device_type": "gateway",
+        "node_id": None,
+        "rns_interface": "lora",
+        "firmware_version": "1.86",
+        "hardware_revision": "rak4631",
         "battery_type": None,
         "install_date": datetime.now(tz=timezone.utc).isoformat(),
         "status": "active",
     },
 ]
 
-# ``rns_destination_hash`` and LoRa params are supplied at runtime.
+# Gateway seed data — only static identifiers.
+# rns_destination_hash is auto-populated by GatewayAnnounceHandler when
+# the gateway announces on the RNS network.  LoRa radio parameters
+# (lora_frequency, lora_spreading_factor) come from the RNode config, not
+# the database, so they are intentionally omitted here.
 RETICULUM_GATEWAYS: list[dict] = [
-    # Populated dynamically in ``main()`` once we know the RNS hash.
+    {
+        "gateway_id": "GW-MIMI-01",
+        "device_id": "RN-HUB-01",
+    },
+    {
+        "gateway_id": "GW-RELAY-01",
+        "device_id": "RN-RELAY-01",
+    },
 ]
 
 
 # ---------------------------------------------------------------------------
-# SQL statements
+# v4 Schema DDL (for reference / future use)
+# ---------------------------------------------------------------------------
+
+SCHEMA_V4_SQL = """
+-- v4 hardware_devices schema (BLE columns removed, RNS columns added)
+CREATE TABLE IF NOT EXISTS hardware_devices (
+    device_id           TEXT PRIMARY KEY,
+    device_type         TEXT CHECK(device_type IN
+                            ('gateway','soil_node','air_node',
+                             'pump_node','gh_actuator',
+                             'vision_node','piw_gateway')),
+    node_id             TEXT REFERENCES sensor_nodes(node_id),
+    rns_identity_hash   TEXT,
+    rns_interface       TEXT DEFAULT 'ble' CHECK(rns_interface IN
+                            ('lora','ble','wifi','serial')),
+    firmware_version    TEXT,
+    hardware_revision   TEXT,
+    battery_type        TEXT,
+    install_date        TEXT,
+    status              TEXT DEFAULT 'active'
+                        CHECK(status IN
+                            ('active','offline','maintenance','decommissioned')),
+    last_seen           TEXT
+);
+
+CREATE TABLE IF NOT EXISTS reticulum_gateways (
+    gateway_id              TEXT PRIMARY KEY,
+    device_id               TEXT REFERENCES hardware_devices(device_id),
+    rns_destination_hash    TEXT UNIQUE,
+    lora_frequency          INTEGER,
+    lora_spreading_factor   INTEGER,
+    last_heartbeat          TEXT,
+    peers_count             INTEGER DEFAULT 0
+);
+"""
+
+
+# ---------------------------------------------------------------------------
+# SQL statements (v4 schema — no ble_mac / ble_target_gateway)
 # ---------------------------------------------------------------------------
 
 INSERT_SENSOR_NODE_SQL = """
@@ -103,28 +209,101 @@ VALUES (:node_id, :name, :location)
 INSERT_HARDWARE_DEVICE_SQL = """
 INSERT OR IGNORE INTO hardware_devices (
     device_id, device_type, node_id,
-    ble_mac, ble_target_gateway,
+    rns_interface,
     firmware_version, hardware_revision,
     battery_type, install_date, status
 ) VALUES (
     :device_id, :device_type, :node_id,
-    :ble_mac, :ble_target_gateway,
+    :rns_interface,
     :firmware_version, :hardware_revision,
     :battery_type, :install_date, :status
 )
 """
 
+# gateways use INSERT OR REPLACE so that a re-provision can update
+# rns_destination_hash if it has been discovered since the last run.
 INSERT_RETICULUM_GATEWAY_SQL = """
-INSERT OR IGNORE INTO reticulum_gateways (
-    gateway_id, device_id,
-    rns_destination_hash,
-    lora_frequency, lora_spreading_factor
+INSERT OR REPLACE INTO reticulum_gateways (
+    gateway_id, device_id
 ) VALUES (
-    :gateway_id, :device_id,
-    :rns_destination_hash,
-    :lora_frequency, :lora_spreading_factor
+    :gateway_id, :device_id
 )
 """
+
+
+# ---------------------------------------------------------------------------
+# Schema DDL — executed before provisioning to ensure tables exist
+# ---------------------------------------------------------------------------
+
+_SCHEMA_DDL = """
+CREATE TABLE IF NOT EXISTS sensor_nodes (
+    node_id         TEXT PRIMARY KEY,
+    name            TEXT,
+    location        TEXT,
+    last_seen       TEXT,
+    battery_level   REAL
+);
+
+CREATE TABLE IF NOT EXISTS hardware_devices (
+    device_id           TEXT PRIMARY KEY,
+    device_type         TEXT CHECK(device_type IN
+                            ('gateway','soil_node','air_node',
+                             'pump_node','gh_actuator',
+                             'vision_node','piw_gateway')),
+    node_id             TEXT REFERENCES sensor_nodes(node_id),
+    rns_identity_hash   TEXT,
+    rns_destination_hash TEXT,
+    rns_interface       TEXT DEFAULT 'ble' CHECK(rns_interface IN
+                            ('lora','ble','wifi','serial')),
+    firmware_version    TEXT,
+    hardware_revision   TEXT,
+    battery_type        TEXT,
+    install_date        TEXT,
+    status              TEXT DEFAULT 'active'
+                        CHECK(status IN
+                            ('active','offline','maintenance','decommissioned')),
+    last_seen           TEXT
+);
+
+CREATE TABLE IF NOT EXISTS reticulum_gateways (
+    gateway_id              TEXT PRIMARY KEY,
+    device_id               TEXT REFERENCES hardware_devices(device_id),
+    rns_destination_hash    TEXT UNIQUE,
+    lora_frequency          INTEGER,
+    lora_spreading_factor   INTEGER,
+    last_heartbeat          TEXT,
+    peers_count             INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS actuator_commands (
+    cmd_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id       TEXT NOT NULL REFERENCES hardware_devices(device_id),
+    cmd_type        TEXT CHECK(cmd_type IN
+                        ('pump_on','pump_off','vent_open','vent_close',
+                         'shade_pct','fan_on','fan_off',
+                         'ota_request','ota_abort')),
+    cmd_value       REAL,
+    cmd_value_text  TEXT,
+    requested_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    executed_at     TEXT,
+    status          TEXT DEFAULT 'pending'
+                    CHECK(status IN
+                        ('pending','transferring','sent','acknowledged','failed','expired')),
+    retry_count     INTEGER DEFAULT 0,
+    last_retry_at   TEXT,
+    error_message   TEXT
+);
+"""
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create all tables with the v4 schema if they don't exist yet.
+
+    This must be called before :func:`provision` so that columns like
+    ``rns_interface`` are present in ``hardware_devices``.
+    """
+    conn.executescript(_SCHEMA_DDL)
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -162,16 +341,19 @@ def connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def provision(conn: sqlite3.Connection, gateway_rns_hash: str) -> dict[str, int]:
+def provision(conn: sqlite3.Connection) -> dict[str, int]:
     """Insert baseline fleet data into the database.
 
-    Uses ``INSERT OR IGNORE`` so the script is idempotent — re-running it
-    will not duplicate rows that already exist.
+    Uses ``INSERT OR IGNORE`` for hardware devices and sensor nodes, and
+    ``INSERT OR REPLACE`` for gateways — so the script is idempotent and
+    re-running it will not duplicate rows.
+
+    RNS identity hashes and destination hashes are **not** seeded here;
+    they are auto-populated by ``GatewayAnnounceHandler`` in
+    ``reticulum_ingest.py`` when nodes announce on the network.
 
     Args:
         conn: An open database connection with foreign keys enabled.
-        gateway_rns_hash: Hex-encoded RNS destination hash for the gateway.
-            May be an empty string if the gateway has not yet announced.
 
     Returns:
         A dict mapping table names to the number of rows inserted.
@@ -187,18 +369,36 @@ def provision(conn: sqlite3.Connection, gateway_rns_hash: str) -> dict[str, int]
     counts["hardware_devices"] = cur.rowcount
 
     # -- reticulum_gateways --------------------------------------------------
-    gateway_row = {
-        "gateway_id": "GW-MIMI-01",
-        "device_id": "GW-MIMI-01",
-        "rns_destination_hash": gateway_rns_hash,
-        "lora_frequency": 867200000,
-        "lora_spreading_factor": 8,
-    }
-    cur = conn.execute(INSERT_RETICULUM_GATEWAY_SQL, gateway_row)
+    cur = conn.executemany(INSERT_RETICULUM_GATEWAY_SQL, RETICULUM_GATEWAYS)
     counts["reticulum_gateways"] = cur.rowcount
 
     conn.commit()
     return counts
+
+
+def discover_and_provision(conn: sqlite3.Connection) -> dict[str, int]:
+    """Connect to the RNS network and auto-populate devices from announces.
+
+    .. TODO::
+        Implement RNS-based discovery.  This should:
+
+        1. Import RNS (``import RNS``) and initialise a shared instance.
+        2. Attach an announce handler that listens for ``agronomi-sensor:``
+           and ``agronomi-gateway:`` app-data prefixes.
+        3. For each announce, INSERT OR IGNORE into ``hardware_devices`` and,
+           for gateways, INSERT OR REPLACE into ``reticulum_gateways`` —
+           exactly as ``GatewayAnnounceHandler`` does in
+           ``reticulum_ingest.py``.
+        4. Optionally use ``rnstatus`` / ``rnid`` CLI output as a fallback
+           data source when a running RNS instance is not available in-process.
+
+    For now this falls back to static provisioning.
+    """
+    logger.warning(
+        "--discover mode is not yet implemented; falling back to static provisioning"
+    )
+    print("NOTE: --discover is a stub.  Falling back to static provisioning.")
+    return provision(conn)
 
 
 def show_tables(conn: sqlite3.Connection) -> None:
@@ -231,7 +431,9 @@ def build_parser() -> argparse.ArgumentParser:
     """Build and return the argument parser."""
     parser = argparse.ArgumentParser(
         description="Provision the AgroNomi database with sensor nodes, "
-        "hardware devices, and gateways.",
+        "hardware devices, and gateways.  RNS identity hashes and "
+        "destination hashes are auto-populated by GatewayAnnounceHandler "
+        "when nodes announce on the network — no manual entry needed.",
     )
     parser.add_argument(
         "--db",
@@ -240,10 +442,10 @@ def build_parser() -> argparse.ArgumentParser:
         "or DB_PATH env var).",
     )
     parser.add_argument(
-        "--gateway-rns-hash",
-        default="",
-        help="Hex-encoded RNS destination hash for the LoRa gateway. "
-        "Defaults to empty string (filled in when gateway announces).",
+        "--discover",
+        action="store_true",
+        help="Auto-discover devices from RNS announces instead of seeding "
+        "static data.  (Stub — falls back to static provisioning for now.)",
     )
     parser.add_argument(
         "--show",
@@ -266,7 +468,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             show_tables(conn)
             return
 
-        counts = provision(conn, args.gateway_rns_hash)
+        ensure_schema(conn)
+
+        if args.discover:
+            counts = discover_and_provision(conn)
+        else:
+            counts = provision(conn)
 
         print("Provisioning complete:")
         for table, n in counts.items():

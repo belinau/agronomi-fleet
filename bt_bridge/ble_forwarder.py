@@ -405,6 +405,12 @@ class GatewayCommandReceiver:
         # then fall back to the disk cache.
         self._pending_firmware = {}
         self._telemetry_sender = telemetry_sender
+        self._pending_ble_ota = (
+            None  # set by _handle_ota_command when BLE fails to connect
+        )
+        self._pico_connected = False  # True when Pico reports [C] (BLE connected)
+        self._pico_mtu = 23  # Default BLE ATT MTU; updated from [MTU] serial line
+        self._ota_ack_waiter = None  # OtaAckWaiter when OTA is in progress
 
         # Register link establishment callback for RNS Resource (OTA) transfers.
         # The hub opens a Link to this destination, then sends the firmware
@@ -546,15 +552,19 @@ class GatewayCommandReceiver:
             RNS.log(f"[CMD] Error processing command: {e}", RNS.LOG_ERROR)
 
     def _handle_ota_command(self, cmd: dict):
-        """Handle an ota_request command by checking cache and triggering BLE flash."""
-        import asyncio
+        """Handle an ota_request command by checking cache and sending OTA via Pico serial."""
         import hashlib
 
-        from ble_ota import handle_ota_command
+        from ble_ota import (
+            OTA_MAX_BLE_RETRIES,
+            OtaAckWaiter,
+            get_ble_mac,
+            send_ota_frames_via_serial,
+        )
         from fw_cache import (
             OTA_CACHE_DIR,
-            fw_cache_path,
             get_cached_firmware,
+            save_firmware_to_cache,
             verify_cached_firmware,
         )
 
@@ -572,7 +582,7 @@ class GatewayCommandReceiver:
 
         fw_version = meta.get("fw_version", cmd.get("fw_version", ""))
         device_type = meta.get("device_type", cmd.get("device_type", ""))
-        sha256 = meta.get("sha256", "")
+        sha256 = meta.get("sha256", cmd.get("sha256", ""))
 
         if not fw_version or not device_type:
             RNS.log(
@@ -666,9 +676,14 @@ class GatewayCommandReceiver:
             )
             return
 
-        # Run BLE OTA in a new event loop (since we're in a sync context)
-        # Use the telemetry sender to send ACK back to hub via RNS
-        # (creates an OUT SINGLE destination to farm.commands_control)
+        # Send OTA frames via Pico serial relay. The Pico forwards binary
+        # frames to the sensor over BLE NUS. If the sensor is not connected,
+        # the Pico will drop the frames (logged as [NOP]) and we'll store
+        # the OTA for retry when the sensor advertises.
+        #
+        # Check if the Pico has an active BLE connection to the sensor.
+        # The serial loop tracks this via [C] and [D] lines from the Pico.
+        # If connected, send immediately. If not, store for later.
         def send_ota_ack(
             cmd_id: int, status: str, fw_version: str = None, error: str = None
         ):
@@ -680,21 +695,191 @@ class GatewayCommandReceiver:
             ack_payload["gateway_id"] = self.gateway_id
             self._telemetry_sender.send_ack(ack_payload)
 
-        try:
-            loop = asyncio.new_event_loop()
-            loop.run_until_complete(
-                handle_ota_command(
-                    rns_hub_dest=None,
-                    cmd=cmd,
-                    firmware_data=firmware_data,
-                    gateway_id=self.gateway_id,
-                    config=self._config,
-                    send_ack_fn=send_ota_ack,
-                )
+        ble_mac = get_ble_mac(device_id, self._config, cmd)
+        if not ble_mac:
+            RNS.log(f"[OTA] No BLE MAC for {device_id} — cannot flash", RNS.LOG_ERROR)
+            send_ota_ack(
+                cmd.get("cmd_id", -1),
+                status="failed",
+                error=f"No BLE MAC for {device_id}",
             )
-            loop.close()
-        except Exception as e:
-            RNS.log(f"[OTA] BLE OTA failed: {e}", RNS.LOG_ERROR)
+            return
+
+        # If the Pico has a BLE connection, send OTA immediately.
+        # Otherwise store for later triggering when sensor advertises.
+        if self._pico_connected:
+            RNS.log(
+                f"[OTA] Pico has BLE connection — sending OTA for {device_id} via serial",
+                RNS.LOG_INFO,
+            )
+
+            # FIX: run OTA in a dedicated thread — never call
+            # send_ota_frames_via_serial() directly from the RNS packet
+            # callback (here) or from the serial read loop. It blocks for
+            # the full OTA duration (tens of seconds) waiting on
+            # ack_waiter.wait(). The ack_waiter is fed by the serial read
+            # loop via cmd_receiver._ota_ack_waiter.set(). If we block
+            # the serial read loop, the ACK can never arrive → deadlock
+            # → always times out.
+            ack_waiter = OtaAckWaiter()
+            self._ota_ack_waiter = ack_waiter
+
+            def run_ota_immediate():
+                success, err = send_ota_frames_via_serial(
+                    self.ser,
+                    firmware_data,
+                    fw_version,
+                    ack_waiter,
+                    device_id,
+                    pico_connected_check=lambda: self._pico_connected,
+                    mtu=lambda: self._pico_mtu,  # callable — reads live MTU
+                )
+                self._ota_ack_waiter = None
+
+                if success:
+                    RNS.log(
+                        f"[OTA] {device_id} flashed successfully → {fw_version}",
+                        RNS.LOG_INFO,
+                    )
+                    send_ota_ack(
+                        cmd.get("cmd_id", -1),
+                        status="acknowledged",
+                        fw_version=fw_version,
+                    )
+                else:
+                    RNS.log(
+                        f"[OTA] OTA via Pico serial failed for {device_id}: {err}. "
+                        f"Storing for retry on next sensor wake cycle.",
+                        RNS.LOG_WARNING,
+                    )
+                    # Store for retry on next sensor wake cycle.
+                    self._pending_ble_ota = {
+                        "cmd": cmd,
+                        "firmware_data": firmware_data,
+                        "ble_mac": ble_mac,
+                        "fw_version": fw_version,
+                        "attempts": 1,
+                    }
+
+            import threading as _threading
+            _threading.Thread(target=run_ota_immediate, daemon=True).start()
+            return  # serial read loop continues immediately
+
+        else:
+            RNS.log(
+                f"[OTA] No BLE connection — storing OTA for {device_id} "
+                f"until sensor advertises.",
+                RNS.LOG_WARNING,
+            )
+
+        # Store for later triggering when we see [C] (BLE connected) on serial.
+        self._pending_ble_ota = {
+            "cmd": cmd,
+            "firmware_data": firmware_data,
+            "ble_mac": ble_mac,
+            "fw_version": fw_version,
+            "attempts": 0,
+        }
+
+    def has_pending_ble_ota(self) -> bool:
+        """Check if there's a pending BLE OTA that hasn't been triggered yet."""
+        return self._pending_ble_ota is not None
+
+    def trigger_pending_ble_ota(self):
+        """Trigger the pending BLE OTA attempt via Pico serial relay.
+
+        Called from the serial loop when we see '[C]' (BLE connected)
+        from a sensor with a pending OTA. The sensor is only connected
+        briefly, so we must act immediately.
+
+        The OTA transfer runs in a separate thread so the serial read
+        loop stays alive to detect disconnects and read ACKs.
+        """
+        if self._pending_ble_ota is None:
+            return
+
+        import threading
+
+        from ble_ota import (
+            OTA_MAX_BLE_RETRIES,
+            OtaAckWaiter,
+            send_ota_frames_via_serial,
+        )
+
+        cmd = self._pending_ble_ota["cmd"]
+        firmware_data = self._pending_ble_ota["firmware_data"]
+        fw_version = self._pending_ble_ota["fw_version"]
+        attempts = self._pending_ble_ota.get("attempts", 0) + 1
+        device_id = cmd.get("device_id", "?")
+
+        RNS.log(
+            f"[OTA] Triggering pending BLE OTA for {device_id} "
+            f"(attempt {attempts}) — sensor is connected now",
+            RNS.LOG_INFO,
+        )
+
+        self._pending_ble_ota["attempts"] = attempts
+
+        def send_ota_ack(
+            cmd_id: int, status: str, fw_version: str = None, error: str = None
+        ):
+            ack_payload = {"cmd_id": cmd_id, "status": status}
+            if fw_version:
+                ack_payload["fw_version"] = fw_version
+            if error:
+                ack_payload["error"] = error
+            ack_payload["gateway_id"] = self.gateway_id
+            self._telemetry_sender.send_ack(ack_payload)
+
+        ack_waiter = OtaAckWaiter()
+        self._ota_ack_waiter = ack_waiter
+
+        def run_ota():
+            success, error = send_ota_frames_via_serial(
+                self.ser,
+                firmware_data,
+                fw_version,
+                ack_waiter,
+                device_id,
+                pico_connected_check=lambda: self._pico_connected,
+                mtu=lambda: self._pico_mtu,  # callable — reads live MTU after BEGIN delay
+            )
+            self._ota_ack_waiter = None
+
+            if success:
+                RNS.log(
+                    f"[OTA] {device_id} flashed successfully → {fw_version}",
+                    RNS.LOG_INFO,
+                )
+                self._pending_ble_ota = None  # clear — OTA done
+                send_ota_ack(
+                    cmd.get("cmd_id", -1),
+                    status="acknowledged",
+                    fw_version=fw_version,
+                )
+                return
+
+            # Failed — keep pending for next wake cycle, up to max retries
+            if attempts >= OTA_MAX_BLE_RETRIES:
+                RNS.log(
+                    f"[OTA] {device_id} failed after {attempts} BLE attempts",
+                    RNS.LOG_ERROR,
+                )
+                send_ota_ack(
+                    cmd.get("cmd_id", -1),
+                    status="failed",
+                    error=f"BLE OTA failed after {attempts} attempts: {error}",
+                )
+                self._pending_ble_ota = None  # clear — give up
+            else:
+                RNS.log(
+                    f"[OTA] BLE attempt {attempts} failed for {device_id}: {error}. "
+                    f"Will retry on next sensor wake cycle.",
+                    RNS.LOG_WARNING,
+                )
+
+        ota_thread = threading.Thread(target=run_ota, daemon=True)
+        ota_thread.start()
 
     @property
     def destination_hash_hex(self) -> str:
@@ -846,7 +1031,8 @@ def run_forwarder(config: dict, identity: RNS.Identity):
             line = line.decode("utf-8", errors="replace").strip()
 
             if not line.startswith("[JSON] "):
-                # Check for ACK lines from the Pico
+                # Check for ACK lines from the Pico — these include OTA ACKs
+                # from the sensor relayed through the Pico
                 if line.startswith("[ACK] "):
                     raw_ack = line[len("[ACK] ") :]
                     try:
@@ -854,6 +1040,9 @@ def run_forwarder(config: dict, identity: RNS.Identity):
                         # Add gateway metadata
                         ack_payload["gateway_id"] = gateway_id
                         sender.send_ack(ack_payload)
+                        # If this is an OTA ACK and we have a waiter, feed it
+                        if "ota_ok" in ack_payload and cmd_receiver._ota_ack_waiter:
+                            cmd_receiver._ota_ack_waiter.set(ack_payload)
                     except json.JSONDecodeError as e:
                         RNS.log(
                             f"[SER] ACK JSON parse error: {e} — line: {raw_ack[:80]}",
@@ -869,6 +1058,63 @@ def run_forwarder(config: dict, identity: RNS.Identity):
                 if line.startswith("[SER]") or line.startswith("rx="):
                     serial_idle_count = 0
                     RNS.log(f"[SER] {line}", RNS.LOG_INFO)
+                    continue
+                # Pico BLE connection events
+                if line.startswith("[C] "):
+                    serial_idle_count = 0
+                    RNS.log(f"[SER] {line}", RNS.LOG_INFO)
+                    cmd_receiver._pico_connected = True
+                    # Parse MTU from [C] <mtu> line — Pico reports negotiated
+                    # MTU inline with the connect event, not as a separate [MTU] line.
+                    try:
+                        mtu_val = int(line.split()[1])
+                        cmd_receiver._pico_mtu = mtu_val
+                        RNS.log(
+                            f"[SER] BLE MTU from connect event: {mtu_val} "
+                            f"(max OTA payload: {mtu_val - 8})",
+                            RNS.LOG_INFO,
+                        )
+                    except (ValueError, IndexError):
+                        pass  # no MTU in line — keep existing value
+                    # If we have a pending BLE OTA, trigger it now
+                    if cmd_receiver.has_pending_ble_ota():
+                        RNS.log(
+                            "[OTA] BLE connected — triggering pending BLE OTA",
+                            RNS.LOG_INFO,
+                        )
+                        cmd_receiver.trigger_pending_ble_ota()
+                    continue
+                # Pico MTU report — negotiated BLE ATT MTU from Pico.
+                # Format: [MTU] <mtu_value> payload=<max_payload>
+                # Used by OTA to size chunks correctly.
+                if line.startswith("[MTU]"):
+                    serial_idle_count = 0
+                    try:
+                        mtu_val = int(line.split()[1])
+                        cmd_receiver._pico_mtu = mtu_val
+                        RNS.log(
+                            f"[SER] BLE MTU negotiated: {mtu_val} (max payload: {mtu_val - 3})",
+                            RNS.LOG_INFO,
+                        )
+                    except (ValueError, IndexError):
+                        RNS.log(
+                            f"[SER] Could not parse MTU line: {line}", RNS.LOG_WARNING
+                        )
+                    continue
+                if line.startswith("[D] "):
+                    serial_idle_count = 0
+                    RNS.log(f"[SER] {line}", RNS.LOG_INFO)
+                    cmd_receiver._pico_connected = False
+                    cmd_receiver._pico_mtu = 23  # Reset to default on disconnect
+                    continue
+                # Sensor is advertising — if we have a pending BLE OTA,
+                # wait for the [C] connection event instead, as the Pico
+                # will connect during the advertising window.
+                if line.strip() == "Advertising":
+                    serial_idle_count = 0
+                    RNS.log(f"[SER] {line}", RNS.LOG_INFO)
+                    # Don't trigger OTA on Advertising alone — wait for [C]
+                    # which means the Pico actually connected to the sensor.
                     continue
                 # Pass-through all other lines to our log
                 if line:

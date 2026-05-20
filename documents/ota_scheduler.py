@@ -37,7 +37,11 @@ OTA_CURRENT_FW = {
         "/var/agronomi/fw/soil_node_1.3.0.bin",
         "placeholder_sha256",
     ),
-    "air_node": ("1.4.0", "/var/agronomi/fw/air_node_1.4.0.bin", "placeholder_sha256"),
+    "air_node": (
+        "1.4.2",
+        "/var/agronomi/fw/air_node_1.4.2.bin",
+        "41d2939cd0c220f1c06f2ab5be42eadb99692ed21d27956d817647ee879e5d5d",
+    ),
 }
 
 # RNS Link establishment timeout for OTA Resource transfer
@@ -386,73 +390,179 @@ def dispatch_ota(
 
     RNS.log(f"[OTA] Link established to gateway for cmd {cmd_id}", RNS.LOG_INFO)
 
-    # Read firmware binary
-    with open(bin_path, "rb") as f:
-        firmware_data = f.read()
-
-    RNS.log(
-        f"[OTA] Sending firmware ({len(firmware_data)} bytes) to gateway for cmd {cmd_id}",
-        RNS.LOG_INFO,
+    # Check if firmware binary needs to be sent via RNS Resource.
+    # If a previous attempt already delivered the binary (status was 'sent')
+    # and the failure was at the BLE stage, the gateway still has the firmware
+    # cached. Skip the expensive LoRa transfer and Link establishment.
+    # Just send the command packet directly — no Link needed.
+    previous_status = conn.execute(
+        "SELECT status FROM actuator_commands WHERE cmd_id=?",
+        (cmd_id,),
+    ).fetchone()
+    firmware_already_delivered = previous_status and previous_status[0] in (
+        "sent",
+        "transferring",
+        "failed",  # previous attempt failed at BLE stage — firmware still cached
     )
-
-    # Send firmware binary as RNS Resource
-    def on_resource_concluded(resource):
-        if resource.status == RNS.Resource.COMPLETE:
-            RNS.log(f"[OTA] Binary delivered to gateway for cmd {cmd_id}", RNS.LOG_INFO)
-            # Send the ota_request command packet so gateway knows what to do
-            payload = json.dumps(
-                {
-                    "cmd_id": cmd_id,
-                    "device_id": device_id,
-                    "cmd_type": "ota_request",
-                    "fw_version": version,
-                    "device_type": dtype,
-                    "sha256": sha256 or actual_sha,
-                    "size_bytes": len(firmware_data),
-                    "ble_mac": ble_mac,
-                    "ts": int(time.time()),
-                }
-            ).encode("utf-8")
-            pkt = RNS.Packet(gw_dest, payload)
-            pkt.send()
-            # Use a fresh DB connection — RNS callbacks run on a
-            # different thread than the one that created `conn`.
-            try:
-                with _get_conn() as cb_conn:
-                    cb_conn.execute(
-                        "UPDATE actuator_commands SET status='sent', last_retry_at=datetime('now') "
-                        "WHERE cmd_id=?",
-                        (cmd_id,),
-                    )
-                    cb_conn.commit()
-            except Exception as e:
-                RNS.log(
-                    f"[OTA] DB update failed after delivery for cmd {cmd_id}: {e}",
-                    RNS.LOG_ERROR,
+    if firmware_already_delivered:
+        RNS.log(
+            f"[OTA] Firmware already delivered to gateway for cmd {cmd_id} "
+            f"(previous status: {previous_status[0]}). Sending command packet only "
+            f"(no Link/Resource needed).",
+            RNS.LOG_INFO,
+        )
+        # Send command packet directly via RNS Packet (no Link needed)
+        payload = json.dumps(
+            {
+                "cmd_id": cmd_id,
+                "device_id": device_id,
+                "cmd_type": "ota_request",
+                "fw_version": version,
+                "device_type": dtype,
+                "sha256": sha256 or actual_sha,
+                "size_bytes": 0,  # 0 = firmware already on gateway
+                "ble_mac": ble_mac,
+                "ts": int(time.time()),
+            }
+        ).encode("utf-8")
+        pkt = RNS.Packet(gw_dest, payload)
+        pkt.send()
+        try:
+            with _get_conn() as cb_conn:
+                cb_conn.execute(
+                    "UPDATE actuator_commands SET status='sent', last_retry_at=datetime('now') "
+                    "WHERE cmd_id=?",
+                    (cmd_id,),
                 )
-        else:
-            RNS.log(f"[OTA] Resource transfer failed for cmd {cmd_id}", RNS.LOG_ERROR)
-            # Use a fresh DB connection for the same thread-safety reason.
-            try:
-                with _get_conn() as cb_conn:
-                    _mark_ota_failed(cb_conn, cmd_id, "Resource transfer incomplete")
-            except Exception as e:
-                RNS.log(f"[OTA] DB update failed for cmd {cmd_id}: {e}", RNS.LOG_ERROR)
-        link.teardown()
+                cb_conn.commit()
+        except Exception as e:
+            RNS.log(
+                f"[OTA] DB update failed after command packet for cmd {cmd_id}: {e}",
+                RNS.LOG_ERROR,
+            )
+        RNS.log(f"[OTA] Command packet sent for cmd {cmd_id}", RNS.LOG_INFO)
+        return
+    else:
+        # Read firmware binary and send via RNS Resource
+        with open(bin_path, "rb") as f:
+            firmware_data = f.read()
 
-    # Calculate a generous timeout for LoRa transfer:
-    # At VERY_SLOW rate (250 B/s), 1.4MB takes ~5700s (~95min).
-    # Use 7200s (2h) as a safe upper bound for large firmware over LoRa.
-    ota_timeout = 7200
-    RNS.log(
-        f"[OTA] Transfer timeout: {ota_timeout}s for {len(firmware_data)} bytes",
-        RNS.LOG_INFO,
+        RNS.log(
+            f"[OTA] Sending firmware ({len(firmware_data)} bytes) to gateway for cmd {cmd_id}",
+            RNS.LOG_INFO,
+        )
+
+        # Send firmware binary as RNS Resource
+        def on_resource_concluded(resource):
+            if resource.status == RNS.Resource.COMPLETE:
+                RNS.log(
+                    f"[OTA] Binary delivered to gateway for cmd {cmd_id}", RNS.LOG_INFO
+                )
+            else:
+                RNS.log(
+                    f"[OTA] Resource transfer failed for cmd {cmd_id}", RNS.LOG_ERROR
+                )
+                # Use a fresh DB connection for thread safety.
+                try:
+                    with _get_conn() as cb_conn:
+                        _mark_ota_failed(
+                            cb_conn, cmd_id, "Resource transfer incomplete"
+                        )
+                except Exception as e:
+                    RNS.log(
+                        f"[OTA] DB update failed for cmd {cmd_id}: {e}", RNS.LOG_ERROR
+                    )
+                link.teardown()
+                return
+            # Fall through to send command packet after resource delivery
+            _send_ota_command_packet(
+                gw_dest,
+                cmd_id,
+                device_id,
+                version,
+                dtype,
+                sha256 or actual_sha,
+                len(firmware_data),
+                ble_mac,
+                conn,
+                cmd_id,
+                link,
+            )
+
+        # Calculate a generous timeout for LoRa transfer:
+        # At VERY_SLOW rate (250 B/s), 1.4MB takes ~5700s (~95min).
+        # Use 7200s (2h) as a safe upper bound for large firmware over LoRa.
+        ota_timeout = 7200
+        RNS.log(
+            f"[OTA] Transfer timeout: {ota_timeout}s for {len(firmware_data)} bytes",
+            RNS.LOG_INFO,
+        )
+
+        resource = RNS.Resource(
+            firmware_data, link, callback=on_resource_concluded, timeout=ota_timeout
+        )
+        # advertise=True is the default, so no separate call needed
+        return  # Command packet will be sent in on_resource_concluded callback
+
+    # Firmware already cached on gateway — send command packet directly
+    _send_ota_command_packet(
+        gw_dest,
+        cmd_id,
+        device_id,
+        version,
+        dtype,
+        sha256 or actual_sha,
+        0,
+        ble_mac,
+        conn,
+        cmd_id,
+        link,
     )
 
-    resource = RNS.Resource(
-        firmware_data, link, callback=on_resource_concluded, timeout=ota_timeout
-    )
-    # advertise=True is the default, so no separate call needed
+
+def _send_ota_command_packet(
+    gw_dest,
+    cmd_id,
+    device_id,
+    version,
+    dtype,
+    sha256,
+    size_bytes,
+    ble_mac,
+    conn,
+    cmd_id_arg,
+    link,
+):
+    """Send the ota_request command packet to the gateway."""
+    payload = json.dumps(
+        {
+            "cmd_id": cmd_id,
+            "device_id": device_id,
+            "cmd_type": "ota_request",
+            "fw_version": version,
+            "device_type": dtype,
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+            "ble_mac": ble_mac,
+            "ts": int(time.time()),
+        }
+    ).encode("utf-8")
+    pkt = RNS.Packet(gw_dest, payload)
+    pkt.send()
+    try:
+        with _get_conn() as cb_conn:
+            cb_conn.execute(
+                "UPDATE actuator_commands SET status='sent', last_retry_at=datetime('now') "
+                "WHERE cmd_id=?",
+                (cmd_id,),
+            )
+            cb_conn.commit()
+    except Exception as e:
+        RNS.log(
+            f"[OTA] DB update failed after command packet for cmd {cmd_id}: {e}",
+            RNS.LOG_ERROR,
+        )
+    link.teardown()
 
 
 def _mark_ota_failed(conn, cmd_id: int, reason: str):

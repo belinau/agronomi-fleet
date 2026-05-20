@@ -6,6 +6,10 @@ AgroNomi Hardware Peripherals Layer
 Architecture
 ~~~~~~~~~~~~
 This daemon runs on the farm hub and speaks Reticulum over LoRa/WiFi/etc.
+In the µReticulum-native architecture, ALL nodes speak RNS directly — there
+is no BLE bridge. Routing is via RNS destination hashes (discovered through
+announces), not BLE MACs. OTA firmware updates are handled by ``rncp``/``rngit``
+utilities, not a custom Python scheduler.
 
 **SINGLE destinations and shared instances**
 
@@ -88,6 +92,11 @@ Why SINGLE instead of PLAIN:
   destination, so it can't route incoming PLAIN packets to the right
   client.  SINGLE destinations, when announced, are visible to the
   instance — it learns the path and can forward packets correctly.
+
+OTA Firmware Updates:
+    In the µR-native architecture, OTA is no longer handled by a custom
+    Python scheduler.  Use the standard RNS utilities ``rncp`` and ``rngit``
+    to push firmware images to nodes over the RNS network.
 
 Dependencies:
     pip install RNS
@@ -201,13 +210,16 @@ CREATE TABLE IF NOT EXISTS hardware_devices (
     device_id           TEXT PRIMARY KEY,
     device_type         TEXT CHECK(device_type IN
                             ('gateway','soil_node','air_node',
-                             'pump_node','gh_actuator')),
+                             'pump_node','gh_actuator',
+                             'vision_node','piw_gateway')),
     node_id             TEXT REFERENCES sensor_nodes(node_id),
-    ble_mac             TEXT,
-    ble_target_gateway  TEXT,
+    rns_identity_hash   TEXT,
+    rns_destination_hash TEXT,
+    rns_interface       TEXT DEFAULT 'ble' CHECK(rns_interface IN
+                            ('lora','ble','wifi','serial')),
     firmware_version    TEXT,
-    hardware_revision  TEXT,
-    battery_type       TEXT,
+    hardware_revision   TEXT,
+    battery_type        TEXT,
     install_date        TEXT,
     status              TEXT DEFAULT 'active'
                         CHECK(status IN
@@ -243,17 +255,6 @@ CREATE TABLE IF NOT EXISTS actuator_commands (
     last_retry_at   TEXT,
     error_message   TEXT
 );
-
-CREATE TABLE IF NOT EXISTS ble_link_log (
-    log_id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    device_id   TEXT,
-    gateway_id  TEXT,
-    event       TEXT CHECK(event IN
-                    ('connected','disconnected','timeout',
-                     'rx_packet','tx_packet','rssi_update')),
-    rssi        INTEGER,
-    recorded_at TEXT
-);
 """
 
 
@@ -272,13 +273,46 @@ def _migrate_schema(conn: sqlite3.Connection):
     """Apply schema migrations for columns added after initial deployment.
 
     Handles:
+    - Adding rns_identity_hash and rns_interface columns to hardware_devices
+    - Adding rns_destination_hash column to hardware_devices
     - Adding cmd_value_text and last_retry_at columns to actuator_commands
     - Expanding the cmd_type CHECK constraint to include ota_request, ota_abort
+    - Dropping the obsolete ble_link_log table
+    - Updating device_type CHECK to add 'vision_node' and 'piw_gateway'
+    - Updating gateway_platform CHECK to add 'esp32c6'
 
     SQLite doesn't support ALTER TABLE to modify CHECK constraints, so if the
     constraint needs updating, we do a full table rebuild.
     """
-    # Check if cmd_value_text column exists
+    # --- hardware_devices migrations ---
+    cursor = conn.execute("PRAGMA table_info(hardware_devices)")
+    hw_columns = [row[1] for row in cursor.fetchall()]
+
+    if "rns_identity_hash" not in hw_columns:
+        RNS.log(
+            "[DB] Adding rns_identity_hash column to hardware_devices", RNS.LOG_INFO
+        )
+        conn.execute("ALTER TABLE hardware_devices ADD COLUMN rns_identity_hash TEXT")
+
+    if "rns_interface" not in hw_columns:
+        RNS.log("[DB] Adding rns_interface column to hardware_devices", RNS.LOG_INFO)
+        conn.execute(
+            "ALTER TABLE hardware_devices ADD COLUMN rns_interface TEXT DEFAULT 'ble'"
+        )
+
+    if "rns_destination_hash" not in hw_columns:
+        RNS.log(
+            "[DB] Adding rns_destination_hash column to hardware_devices", RNS.LOG_INFO
+        )
+        conn.execute(
+            "ALTER TABLE hardware_devices ADD COLUMN rns_destination_hash TEXT"
+        )
+
+    # Note: ble_mac and ble_target_gateway columns are left in place if they
+    # exist (SQLite < 3.35.0 doesn't support DROP COLUMN).  They are no longer
+    # used by the application code.
+
+    # --- actuator_commands migrations ---
     cursor = conn.execute("PRAGMA table_info(actuator_commands)")
     columns = [row[1] for row in cursor.fetchall()]
 
@@ -335,6 +369,55 @@ def _migrate_schema(conn: sqlite3.Connection):
                 ALTER TABLE actuator_commands_new RENAME TO actuator_commands;
             """)
 
+    # --- hardware_devices: rebuild if CHECK constraints need updating ---
+    cursor = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='hardware_devices'"
+    )
+    row = cursor.fetchone()
+    if row and row[0]:
+        schema_sql = row[0]
+        needs_rebuild = "vision_node" not in schema_sql
+        if needs_rebuild:
+            RNS.log(
+                "[DB] Rebuilding hardware_devices with expanded device_type and rns columns",
+                RNS.LOG_INFO,
+            )
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS hardware_devices_new (
+                    device_id           TEXT PRIMARY KEY,
+                    device_type         TEXT CHECK(device_type IN
+                                            ('gateway','soil_node','air_node',
+                                             'pump_node','gh_actuator',
+                                             'vision_node','piw_gateway')),
+                    node_id             TEXT,
+                    rns_identity_hash   TEXT,
+                    rns_destination_hash TEXT,
+                    rns_interface       TEXT DEFAULT 'ble' CHECK(rns_interface IN
+                                            ('lora','ble','wifi','serial')),
+                    firmware_version    TEXT,
+                    hardware_revision   TEXT,
+                    battery_type        TEXT,
+                    install_date        TEXT,
+                    status              TEXT DEFAULT 'active'
+                                        CHECK(status IN
+                                            ('active','offline','maintenance','decommissioned')),
+                    last_seen           TEXT
+                );
+                INSERT OR IGNORE INTO hardware_devices_new
+                    SELECT device_id, device_type, node_id,
+                           rns_identity_hash, NULL,
+                           rns_interface,
+                           firmware_version, hardware_revision, battery_type,
+                           install_date, status, last_seen
+                    FROM hardware_devices;
+                DROP TABLE hardware_devices;
+                ALTER TABLE hardware_devices_new RENAME TO hardware_devices;
+            """)
+
+    # --- Drop obsolete ble_link_log table ---
+    conn.execute("DROP TABLE IF EXISTS ble_link_log")
+    RNS.log("[DB] Dropped ble_link_log table if it existed", RNS.LOG_INFO)
+
     conn.commit()
 
 
@@ -342,12 +425,16 @@ def record_telemetry(
     device_id: str,
     readings: dict,
     battery_v: Optional[float] = None,
-    ble_mac: Optional[str] = None,
+    rns_interface: str = "ble",
     device_type: Optional[str] = None,
     fw_ver: Optional[str] = None,
     gateway_id: Optional[str] = None,
 ):
-    """Write parsed sensor readings into sensor_readings table."""
+    """Write parsed sensor readings into sensor_readings table.
+
+    In the µR-native architecture, gateway_id is the device's own RNS name
+    (not a BLE gateway).  Routing is via RNS destination hashes, not BLE MACs.
+    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_db() as conn:
         row = conn.execute(
@@ -361,11 +448,12 @@ def record_telemetry(
             "SELECT node_id FROM sensor_nodes WHERE node_id = ?", (node_id,)
         ).fetchone()
         if not existing:
-            # Try to derive a human-readable name from the device_id
-            node_name = {
-                "SN-SOIL-01": "Soil Sensor 1",
-                "SN-AIR-01": "Air Sensor 1",
-            }.get(device_id, device_id)
+            # Look up a human-readable name from sensor_nodes if it was auto-provisioned
+            # by GatewayAnnounceHandler; otherwise fall back to device_id itself.
+            name_row = conn.execute(
+                "SELECT name FROM sensor_nodes WHERE node_id = ?", (device_id,)
+            ).fetchone()
+            node_name = name_row["name"] if name_row and name_row["name"] else device_id
             conn.execute(
                 "INSERT OR IGNORE INTO sensor_nodes (node_id, name) VALUES (?, ?)",
                 (node_id, node_name),
@@ -378,24 +466,18 @@ def record_telemetry(
             "SELECT device_id FROM hardware_devices WHERE device_id = ?", (device_id,)
         ).fetchone()
         if not hw_existing:
-            resolved_device_type = device_type or {
-                "SN-SOIL-01": "soil_node",
-                "SN-AIR-01": "air_node",
-                "AN-PUMP-01": "pump_node",
-                "AN-GREENHOUSE-01": "gh_actuator",
-            }.get(device_id, "soil_node")
+            resolved_device_type = device_type or _derive_device_type(device_id)
             conn.execute(
                 """INSERT OR IGNORE INTO hardware_devices
                    (device_id, device_type, node_id, firmware_version,
-                    ble_mac, ble_target_gateway, status)
-                   VALUES (?, ?, ?, ?, ?, ?, 'active')""",
+                    rns_interface, status)
+                   VALUES (?, ?, ?, ?, ?, 'active')""",
                 (
                     device_id,
                     resolved_device_type,
                     device_id,
                     fw_ver or "0.0.0",
-                    ble_mac,
-                    gateway_id if gateway_id and gateway_id != "unknown" else None,
+                    rns_interface,
                 ),
             )
             conn.commit()
@@ -414,14 +496,14 @@ def record_telemetry(
         # Enrich existing hardware_devices with auto-discovered fields
         enrich_parts = []
         enrich_params = []
-        if ble_mac:
+        if rns_interface:
             cur = conn.execute(
-                "SELECT ble_mac FROM hardware_devices WHERE device_id = ? AND (ble_mac IS NULL OR ble_mac LIKE 'AA:BB:CC%')",
+                "SELECT rns_interface FROM hardware_devices WHERE device_id = ? AND rns_interface IS NULL",
                 (device_id,),
             ).fetchone()
             if cur:
-                enrich_parts.append("ble_mac = ?")
-                enrich_params.append(ble_mac)
+                enrich_parts.append("rns_interface = ?")
+                enrich_params.append(rns_interface)
         if fw_ver:
             cur = conn.execute(
                 "SELECT firmware_version FROM hardware_devices WHERE device_id = ? AND (firmware_version IS NULL OR firmware_version = '0.0.0')",
@@ -430,14 +512,6 @@ def record_telemetry(
             if cur:
                 enrich_parts.append("firmware_version = ?")
                 enrich_params.append(fw_ver)
-        if gateway_id and gateway_id != "unknown":
-            cur = conn.execute(
-                "SELECT ble_target_gateway FROM hardware_devices WHERE device_id = ? AND ble_target_gateway IS NULL",
-                (device_id,),
-            ).fetchone()
-            if cur:
-                enrich_parts.append("ble_target_gateway = ?")
-                enrich_params.append(gateway_id)
         if enrich_parts:
             enrich_params.append(device_id)
             set_clause = ", ".join(enrich_parts)
@@ -512,14 +586,7 @@ def update_actuator_status(cmd_id: int, status: str, error: Optional[str] = None
         conn.commit()
 
 
-def log_ble_meta(device_id: str, gateway_id: str, rssi: int):
-    with get_db() as conn:
-        conn.execute(
-            """INSERT INTO ble_link_log (device_id, gateway_id, event, rssi, recorded_at)
-               VALUES (?, ?, 'rssi_update', ?, datetime('now'))""",
-            (device_id, gateway_id, rssi),
-        )
-        conn.commit()
+# REMOVED: log_ble_meta() — BLE link logging is obsolete in the µR-native architecture
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +687,7 @@ class TelemetryDestination:
         readings = payload.get("readings", {})
         battery_v = payload.get("bat_v")
         gateway_id = payload.get("gateway_id", "unknown")
-        ble_mac = payload.get("ble_mac")
+        rns_interface = payload.get("rns_interface", "ble")
         device_type = payload.get("device_type")
         fw_ver = payload.get("fw_ver")
 
@@ -649,7 +716,7 @@ class TelemetryDestination:
                 device_id,
                 readings,
                 battery_v,
-                ble_mac=ble_mac,
+                rns_interface=rns_interface,
                 device_type=device_type,
                 fw_ver=fw_ver,
                 gateway_id=gateway_id,
@@ -658,13 +725,6 @@ class TelemetryDestination:
         except Exception as e:
             RNS.log(f"[ERROR] DB write failed for {device_id}: {e}", RNS.LOG_ERROR)
             return
-
-        rssi = payload.get("ble_rssi")
-        if rssi is not None:
-            try:
-                log_ble_meta(device_id, gateway_id, int(rssi))
-            except Exception as e:
-                RNS.log(f"[WARN] BLE meta log failed: {e}", RNS.LOG_WARNING)
 
 
 class CommandAckDestination:
@@ -720,6 +780,21 @@ class CommandAckDestination:
             if cmd_id is not None and status:
                 update_actuator_status(int(cmd_id), status, error)
 
+                # Track rns_interface if present in ACK payload
+                if ack.get("rns_interface"):
+                    with get_db() as conn:
+                        row = conn.execute(
+                            "SELECT device_id FROM actuator_commands WHERE cmd_id=?",
+                            (cmd_id,),
+                        ).fetchone()
+                        if row:
+                            conn.execute(
+                                "UPDATE hardware_devices SET rns_interface=? "
+                                "WHERE device_id=?",
+                                (ack["rns_interface"], row["device_id"]),
+                            )
+                            conn.commit()
+
                 # OTA ACK: update firmware_version in hardware_devices
                 if status == "acknowledged" and ack.get("fw_version"):
                     with get_db() as conn:
@@ -748,16 +823,52 @@ class CommandAckDestination:
 
 
 # ---------------------------------------------------------------------------
+# HELPER — derive device_type from node_id prefix
+# ---------------------------------------------------------------------------
+
+
+def _derive_device_type(node_id: str) -> str:
+    """Map a node_id prefix to the corresponding hardware_devices device_type.
+
+    Prefix conventions:
+        SN-SOIL-*       → soil_node
+        SN-AIR-*        → air_node
+        AN-PUMP-*        → pump_node
+        AN-GREENHOUSE-*  → gh_actuator
+        RN-* or GW-*     → gateway
+
+    Falls back to 'gateway' if the prefix is unrecognised.
+    """
+    if node_id.startswith("SN-SOIL-"):
+        return "soil_node"
+    elif node_id.startswith("SN-AIR-"):
+        return "air_node"
+    elif node_id.startswith("AN-PUMP-"):
+        return "pump_node"
+    elif node_id.startswith("AN-GREENHOUSE-"):
+        return "gh_actuator"
+    elif node_id.startswith("RN-") or node_id.startswith("GW-"):
+        return "gateway"
+    else:
+        return "gateway"
+
+
+# ---------------------------------------------------------------------------
 # GATEWAY ANNOUNCE HANDLER — auto-discover gateways via RNS announces
 # ---------------------------------------------------------------------------
 
 
 class GatewayAnnounceHandler:
-    """Discovers field gateways via RNS announces and auto-provisions them in the DB.
+    """Discovers field gateways, sensor nodes, AND actuator nodes via RNS announces
+    and auto-provisions them in the DB.
 
-    When a gateway announces its command destination (farm.gateway_commands),
+    In the µR-native architecture, ALL nodes announce on the network. This handler
+    processes ``agronomi-gateway:``, ``agronomi-sensor:``, and ``agronomi-actuator:``
+    prefixes.
+
+    When a node announces its command destination (farm.gateway_commands),
     this handler captures the destination hash and identity, then updates
-    reticulum_gateways so the CommandDispatcher can reach it.
+    reticulum_gateways / hardware_devices so the CommandDispatcher can reach it.
 
     This eliminates the need for manually copying destination hashes into the DB.
     """
@@ -766,20 +877,34 @@ class GatewayAnnounceHandler:
 
     def received_announce(self, destination_hash, announced_identity, app_data):
         gateway_id = None
+        is_sensor = False
+        is_actuator = False
         if app_data:
             try:
                 text = app_data.decode("utf-8", errors="replace")
-                # app_data format: "agronomi-gateway:GW-MIMI-01"
+                # app_data format examples:
+                #   "agronomi-gateway:GW-MIMI-01"
+                #   "agronomi-sensor:SN-SOIL-01"
+                #   "agronomi-actuator:AN-PUMP-01"
                 if text.startswith("agronomi-gateway:"):
                     gateway_id = text.split(":", 1)[1]
+                elif text.startswith("agronomi-sensor:"):
+                    gateway_id = text.split(":", 1)[1]
+                    is_sensor = True
+                elif text.startswith("agronomi-actuator:"):
+                    gateway_id = text.split(":", 1)[1]
+                    is_actuator = True
             except Exception:
                 pass
 
         # RNS.prettyhexrep() returns '<hex>' with angle brackets.
         # Strip them so bytes.fromhex() works when dispatching commands.
         dest_hash_hex = RNS.prettyhexrep(destination_hash).strip("<>")
+        node_kind = (
+            "Actuator" if is_actuator else ("Sensor" if is_sensor else "Gateway")
+        )
         RNS.log(
-            f"[GW-DISCOV] Gateway announce: {dest_hash_hex} gateway_id={gateway_id}",
+            f"[GW-DISCOV] {node_kind} announce: {dest_hash_hex} id={gateway_id}",
             RNS.LOG_INFO,
         )
 
@@ -787,44 +912,64 @@ class GatewayAnnounceHandler:
         # RNS already stores it, but let's make sure.
         RNS.Identity.recall(destination_hash)
 
+        # Derive RNS identity hash from the announced identity
+        rns_identity_hash = None
+        if announced_identity:
+            rns_identity_hash = RNS.prettyhexrep(announced_identity.hash).strip("<>")
+
         # Update DB
         if not gateway_id:
             RNS.log(
-                "[GW-DISCOV] No gateway_id in app_data — cannot auto-provision",
+                "[GW-DISCOV] No id in app_data — cannot auto-provision",
                 RNS.LOG_WARNING,
             )
             return
 
+        # Derive device_type from the node_id prefix
+        device_type = _derive_device_type(gateway_id)
+
         try:
             with get_db() as conn:
-                # Ensure hardware_devices parent row exists FIRST —
-                # reticulum_gateways.device_id has FK → hardware_devices,
-                # so the parent must be inserted before the child.
+                # --- All node types: upsert into hardware_devices ---
                 conn.execute(
                     """
-                    INSERT OR IGNORE INTO hardware_devices
-                        (device_id, device_type, status, install_date)
-                    VALUES (?, 'gateway', 'active', datetime('now'))
-                """,
-                    (gateway_id,),
+                    INSERT INTO hardware_devices
+                        (device_id, device_type, rns_identity_hash,
+                         rns_destination_hash, rns_interface, status, install_date)
+                    VALUES (?, ?, ?, ?, ?, 'active', datetime('now'))
+                    ON CONFLICT(device_id) DO UPDATE SET
+                        rns_identity_hash   = COALESCE(excluded.rns_identity_hash, hardware_devices.rns_identity_hash),
+                        rns_destination_hash = COALESCE(excluded.rns_destination_hash, hardware_devices.rns_destination_hash),
+                        status = 'active',
+                        last_seen = datetime('now')
+                    """,
+                    (
+                        gateway_id,
+                        device_type,
+                        rns_identity_hash,
+                        dest_hash_hex,
+                        "lora" if device_type == "gateway" else "ble",
+                    ),
                 )
                 conn.commit()
 
-                # Now upsert into reticulum_gateways (FK safe)
-                conn.execute(
-                    """
-                    INSERT INTO reticulum_gateways
-                        (gateway_id, device_id, rns_destination_hash, peers_count)
-                    VALUES (?, ?, ?, 0)
-                    ON CONFLICT(gateway_id) DO UPDATE SET
-                        rns_destination_hash = excluded.rns_destination_hash,
-                        last_heartbeat = datetime('now')
-                """,
-                    (gateway_id, gateway_id, dest_hash_hex),
-                )
-                conn.commit()
+                # --- Gateways only: also upsert into reticulum_gateways ---
+                if device_type == "gateway":
+                    conn.execute(
+                        """
+                        INSERT INTO reticulum_gateways
+                            (gateway_id, device_id, rns_destination_hash, peers_count)
+                        VALUES (?, ?, ?, 0)
+                        ON CONFLICT(gateway_id) DO UPDATE SET
+                            rns_destination_hash = excluded.rns_destination_hash,
+                            last_heartbeat = datetime('now')
+                        """,
+                        (gateway_id, gateway_id, dest_hash_hex),
+                    )
+                    conn.commit()
+
                 RNS.log(
-                    f"[GW-DISCOV] Gateway {gateway_id} announced ({dest_hash_hex})",
+                    f"[GW-DISCOV] {node_kind} {gateway_id} ({device_type}) announced ({dest_hash_hex})",
                     RNS.LOG_INFO,
                 )
         except Exception as e:
@@ -879,6 +1024,9 @@ class CommandDispatcher:
                 cmd_type = row["cmd_type"]
 
                 # OTA requests use RNS Link + Resource (not plain Packet)
+                # In µR-native architecture, OTA is now handled by rncp/rngit utilities.
+                # The ota_scheduler import is kept for backward compatibility but
+                # OTA dispatch should be migrated to rncp/rngit.
                 if cmd_type == "ota_request":
                     cmd_value_text = row["cmd_value_text"]
                     if not cmd_value_text:
@@ -889,17 +1037,15 @@ class CommandDispatcher:
                         continue
 
                     gw_row = conn.execute(
-                        """SELECT rg.rns_destination_hash
+                        """SELECT hd.rns_destination_hash
                            FROM hardware_devices hd
-                           JOIN reticulum_gateways rg
-                             ON hd.ble_target_gateway = rg.gateway_id
                            WHERE hd.device_id = ?""",
                         (device_id,),
                     ).fetchone()
 
-                    if not gw_row:
+                    if not gw_row or not gw_row["rns_destination_hash"]:
                         RNS.log(
-                            f"[WARN] No gateway mapping for {device_id}",
+                            f"[WARN] No destination hash for {device_id}",
                             RNS.LOG_WARNING,
                         )
                         continue
@@ -919,47 +1065,38 @@ class CommandDispatcher:
                     )
                     conn.commit()
 
-                    # Look up BLE MAC for the target device
-                    ble_mac_row = conn.execute(
-                        "SELECT ble_mac FROM hardware_devices WHERE device_id = ?",
-                        (device_id,),
-                    ).fetchone()
-                    ble_mac = ble_mac_row["ble_mac"] if ble_mac_row else None
-
                     dispatch_ota(
                         conn,
                         cmd_id,
                         device_id,
                         cmd_value_text,
                         gw_row["rns_destination_hash"],
-                        ble_mac,
                     )
                     continue
 
                 # Regular actuator commands use plain RNS Packet
-                gw_row = conn.execute(
-                    """SELECT rg.rns_destination_hash
-                       FROM hardware_devices hd
-                       JOIN reticulum_gateways rg
-                         ON hd.ble_target_gateway = rg.gateway_id
-                       WHERE hd.device_id = ?""",
+                dest_row = conn.execute(
+                    """SELECT rns_destination_hash
+                       FROM hardware_devices
+                       WHERE device_id = ?""",
                     (device_id,),
                 ).fetchone()
 
-                if not gw_row:
+                if not dest_row or not dest_row["rns_destination_hash"]:
                     RNS.log(
-                        f"[WARN] No gateway mapping for {device_id}", RNS.LOG_WARNING
+                        f"[WARN] No destination hash for {device_id}",
+                        RNS.LOG_WARNING,
                     )
                     continue
 
-                dest_hash_hex = gw_row["rns_destination_hash"]
+                dest_hash_hex = dest_row["rns_destination_hash"]
 
-                # Look up BLE MAC for the target device
-                ble_mac_row = conn.execute(
-                    "SELECT ble_mac FROM hardware_devices WHERE device_id = ?",
+                # Look up rns_interface for the target device
+                iface_row = conn.execute(
+                    "SELECT rns_interface FROM hardware_devices WHERE device_id = ?",
                     (device_id,),
                 ).fetchone()
-                ble_mac = ble_mac_row["ble_mac"] if ble_mac_row else None
+                rns_interface = iface_row["rns_interface"] if iface_row else "ble"
 
                 payload = json.dumps(
                     {
@@ -967,7 +1104,7 @@ class CommandDispatcher:
                         "device_id": device_id,
                         "cmd_type": cmd_type,
                         "cmd_value": row["cmd_value"],
-                        "ble_mac": ble_mac,
+                        "rns_interface": rns_interface,
                         "ts": int(time.time()),
                     }
                 ).encode("utf-8")
@@ -1131,14 +1268,22 @@ def main():
     dispatch_thread.start()
 
     # Start OTA scheduler thread
-    import ota_scheduler
-
-    ota_scheduler.set_db_module(sys.modules[__name__])
-    ota_thread = threading.Thread(
-        target=ota_scheduler.run_ota_scheduler, daemon=True, name="ota_scheduler"
+    # NOTE: In the µR-native architecture, OTA firmware updates are now handled
+    # by the standard RNS utilities `rncp` and `rngit`, not a custom Python scheduler.
+    # The ota_scheduler import and thread startup are commented out below.
+    # If you still need the legacy OTA scheduler for backward compatibility,
+    # uncomment these lines.
+    RNS.log(
+        "[OTA] In µR-native architecture, OTA is handled by rncp/rngit utilities",
+        RNS.LOG_INFO,
     )
-    ota_thread.start()
-    RNS.log("[OTA] Scheduler thread started", RNS.LOG_INFO)
+    # import ota_scheduler
+    # ota_scheduler.set_db_module(sys.modules[__name__])
+    # ota_thread = threading.Thread(
+    #     target=ota_scheduler.run_ota_scheduler, daemon=True, name="ota_scheduler"
+    # )
+    # ota_thread.start()
+    # RNS.log("[OTA] Scheduler thread started", RNS.LOG_INFO)
 
     RNS.log("=" * 60)
     RNS.log("Farm Reticulum Ingest Daemon is running")

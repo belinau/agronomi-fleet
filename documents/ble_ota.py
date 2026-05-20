@@ -5,7 +5,7 @@ Sends firmware OTA frames to the Pico over serial, which relays them
 to the sensor over BLE NUS. The Pico is the BLE bridge — it has the
 direct BLE connection to the sensor.
 
-Serial OTA protocol (Mimi → Pico):
+Serial OTA protocol (Pi → Pico):
   [OTA_BEGIN]<base64>  — base64(0xA0 + total_size_u32LE + fw_version_str)
   [OTA_DATA]<base64>   — base64(0xA1 + seq_u32LE + payload_bytes)
   [OTA_END]<base64>    — base64(0xA2 + fw_version_str)
@@ -15,28 +15,13 @@ to the sensor via ble.gatts_notify().
 
 ACK from sensor (received on Pico serial as [ACK] JSON line):
   {"ota_ok": true, "fw_ver": "1.3.0"}   — success
-  {"ota_ok": false, "error": "reason"}  — failure
+  {"ota_ok": false, "error": "reason"}    — failure
 
 Protocol (matches OTAManager.cpp on C6):
   [0xA0][total_size uint32 LE][fw_version str]  — OTA_BEGIN
   [0xA1][seq uint32 LE][payload...]              — OTA_DATA chunk
   [0xA2][fw_version str]                         — OTA_END
   [0xA3]                                         — OTA_ABORT
-
-Chunk size derivation:
-  BLE ATT notify limit = negotiated_mtu - 3 (ATT header overhead)
-  OTA_DATA frame header = 5 bytes (0xA1 + seq uint32 LE)
-  Max payload per chunk = negotiated_mtu - 3 - 5 = negotiated_mtu - 8
-
-  With NimBLE setMTU(247): max payload = 247 - 8 = 239 bytes.
-  This matches OTA_CHUNK_SIZE in OTAManager.h.
-
-IMPORTANT — OTA only works in BLE Phase 1 (C6 as central/client):
-  The Pico is always the GATT server. OTA frames are delivered via
-  gatts_notify on the NUS TX characteristic, which the C6 subscribes
-  to when it connects as client in _runPhase1Client(). If the C6 is
-  in Phase 2 (peripheral/server mode), OTA is not supported — the
-  Pico never acts as a GATT client and cannot write to the C6.
 """
 
 import base64
@@ -51,49 +36,41 @@ OTA_HDR_BEGIN = 0xA0
 OTA_HDR_DATA = 0xA1
 OTA_HDR_END = 0xA2
 OTA_HDR_ABORT = 0xA3
+OTA_CHUNK_SIZE = 241  # Must match OTAManager.h OTA_CHUNK_SIZE
 
-# Maximum OTA_DATA frame payload size.
-#
-# BLE ATT notify limit = negotiated_mtu - 3 bytes ATT overhead.
-# OTA_DATA frame header = 5 bytes (0xA1 opcode + 4-byte seq).
-# Max safe payload = negotiated_mtu - 3 - 5 = negotiated_mtu - 8.
-#
-# With NimBLE setMTU(247) on both sides: max payload = 247 - 8 = 239.
-# This is OTA_CHUNK_SIZE in OTAManager.h. Must be kept in sync.
-#
-# FIX: was 244 (= MTU - 3, ignoring the 5-byte OTA_DATA frame header),
-# which caused every chunk to be 5 bytes over the ATT notify limit.
-OTA_CHUNK_SIZE_MAX = 239  # Must match OTAManager.h OTA_CHUNK_SIZE
-
-# Safe default when MTU is not yet known (BLE default ATT MTU = 23,
-# payload = 23 - 3 - 5 = 15 bytes). Used only until [MTU] is reported.
-OTA_CHUNK_SIZE_DEFAULT = 15
-
-# Retry configuration.
+# Retry configuration
 # SN-AIR wakes every 300s (5 min), advertises for ~7s per wake cycle.
 # Retries are aligned to catch the sensor during its advertising window.
 OTA_MAX_BLE_RETRIES = 8
-OTA_BLE_BACKOFF = [5, 30, 90, 300, 300, 300, 300, 300]
+OTA_BLE_BACKOFF = [
+    5,
+    30,
+    90,
+    300,
+    300,
+    300,
+    300,
+    300,
+]  # aligned with sensor 5-min cycle
 
-# Timeout for OTA ACK from sensor (received as [ACK] line on serial).
+# Timeout for OTA ACK from sensor (received as [ACK] line on serial)
 OTA_ACK_TIMEOUT = 60  # seconds — sensor reboot can take up to 30s
 
-# Inter-chunk delay.
-# Paces BLE transmissions so the Pico's gatts_notify() queue and the
-# sensor's NimBLE callback (which calls esp_ota_write for each chunk)
-# don't overflow. 5ms gives ~48KB/s throughput at 239-byte chunks with
-# a properly negotiated MTU — well within BLE 4.2 capacity.
-OTA_CHUNK_DELAY = 0.005  # seconds between OTA_DATA frames
+# Inter-chunk delay: the Pico's BLE NUS has a limited TX buffer and
+# the ESP32-C6's NimBLE stack can only queue a few notifications at a
+# time. Without pacing, gatts_notify() calls overwhelm the BLE stack
+# and the sensor's NimBLE callback drops frames. 10ms per chunk gives
+# the BLE stack time to transmit each notification before queuing the
+# next one, and matches the ~241-byte chunk at ~24KB/s BLE throughput.
+OTA_CHUNK_DELAY = 0.010  # seconds between OTA_DATA frames
 
-# Post-BEGIN delay.
-# esp_ota_begin() on the C6 erases the OTA flash partition (1-2s) and
-# the NimBLE stack blocks during that erase — any OTA_DATA frames
-# arriving during this window are silently dropped.
-# The sensor's checkOTACommand() waits 5s for an OTA command; if
-# OTA_BEGIN arrives early in that window we need to cover the full
-# erase time plus the loop entry time.
-# 5s covers flash erase (2s) + loop entry margin (3s).
-OTA_BEGIN_DELAY = 5.0  # seconds after OTA_BEGIN before sending first chunk
+# Post-BEGIN delay: esp_ota_begin() on ESP32-C6 must erase the OTA
+# partition flash before it can accept writes. This takes 1-2 seconds
+# depending on partition size. The sensor's handleNusNotify callback
+# calls beginBLE() synchronously, and the NimBLE stack blocks until it
+# returns — so the Pico can't send more frames during this window.
+# A 3-second delay ensures the sensor is ready to receive data chunks.
+OTA_BEGIN_DELAY = 3.0  # seconds after OTA_BEGIN before sending chunks
 
 
 def get_ble_mac(device_id: str, config: dict, cmd: dict | None = None) -> str | None:
@@ -103,13 +80,16 @@ def get_ble_mac(device_id: str, config: dict, cmd: dict | None = None) -> str | 
     1. The ble_mac field in the command payload (sent by hub from DB)
     2. The gateway's local ble_mac_map config
 
-    NOTE: The MAC is not used for direct BLE connection (that was the
-    old bleak approach). It is kept for logging/identification only.
+    NOTE: The MAC is not used for direct BLE connection anymore (that
+    was the old bleak approach). It's kept for logging/identification.
     """
+    # Hub-provided MAC takes priority (comes from DB, always up-to-date)
     if cmd and cmd.get("ble_mac"):
         mac = cmd["ble_mac"]
         if mac and not mac.startswith("AA:BB:CC"):  # skip placeholder MACs
             return mac
+
+    # Fallback to local config map
     ble_map = config.get("ble_mac_map", {})
     return ble_map.get(device_id)
 
@@ -150,33 +130,20 @@ def send_ota_frames_via_serial(
     ack_waiter: OtaAckWaiter,
     device_id: str = "?",
     pico_connected_check=None,
-    mtu=0,
 ) -> tuple[bool, str]:
     """Send OTA firmware frames to the sensor via Pico serial relay.
 
-    The Pico already has a BLE connection to the sensor (via NUS GATT
-    server). We send OTA frames over serial; the Pico decodes and
-    relays them via gatts_notify().
-
-    IMPORTANT: This function must be called from a dedicated thread,
-    NOT from the RNS packet callback or the serial read loop. It
-    blocks for the full OTA duration (tens of seconds) and requires
-    the serial read loop to remain alive to feed ack_waiter.
+    This replaces the old bleak-based direct BLE connection. The Pico
+    already has a BLE connection to the sensor (via NUS). We send OTA
+    frames over serial to the Pico, which decodes and relays them.
 
     Args:
         ser: serial.Serial port connected to Pico
         firmware_data: Verified firmware binary bytes
         fw_version: Target firmware version string (e.g. "1.4.0")
-        ack_waiter: OtaAckWaiter instance for receiving sensor ACK.
-            Must be fed by an independent serial read loop — this
-            function blocks waiting on it after sending OTA_END.
+        ack_waiter: OtaAckWaiter instance for receiving sensor ACK
         device_id: Device ID for logging
-        pico_connected_check: Callable returning True if Pico has BLE
-            connection to the sensor. Checked before each chunk.
-        mtu: Negotiated BLE ATT MTU from Pico. int or callable returning
-            int. 0 means unknown — use OTA_CHUNK_SIZE_DEFAULT.
-            If callable, called once after OTA_BEGIN_DELAY so the
-            serial loop has time to process the [MTU] line.
+        pico_connected_check: Callable returning True if Pico has BLE connection
 
     Returns:
         (success: bool, error_message: str)
@@ -200,37 +167,17 @@ def send_ota_frames_via_serial(
         ser.write(line.encode("utf-8"))
         ser.flush()
         RNS.log(f"[OTA] Sent OTA_BEGIN ({total} bytes, v{fw_version})", RNS.LOG_INFO)
-
-        # Wait for sensor to complete esp_ota_begin (flash erase).
-        # The serial read loop processes [MTU] during this delay.
-        time.sleep(OTA_BEGIN_DELAY)
-
-        # Compute chunk size now — serial loop has had time to
-        # process the [MTU] line and update the callable/value.
-        #
-        # FIX: chunk_size = mtu - 8, not mtu - 3.
-        # The ATT notify overhead is 3 bytes (mtu - 3 = max notify payload).
-        # The OTA_DATA frame header is 5 bytes (0xA1 + seq uint32 LE).
-        # So max safe payload = (mtu - 3) - 5 = mtu - 8.
-        current_mtu = mtu() if callable(mtu) else mtu
-        if current_mtu >= 8:
-            chunk_size = min(OTA_CHUNK_SIZE_MAX, current_mtu - 8)
-        else:
-            chunk_size = OTA_CHUNK_SIZE_DEFAULT
-        RNS.log(
-            f"[OTA] Using chunk_size={chunk_size} (mtu={current_mtu}, "
-            f"max={OTA_CHUNK_SIZE_MAX}, default={OTA_CHUNK_SIZE_DEFAULT})",
-            RNS.LOG_INFO,
-        )
+        time.sleep(OTA_BEGIN_DELAY)  # give sensor time to call esp_ota_begin
 
         # --- OTA_DATA chunks ---
         seq = 0
         offset = 0
         while offset < total:
+            # Check if sensor is still connected before each chunk
             if pico_connected_check and not pico_connected_check():
                 return False, "BLE disconnected during OTA transfer"
 
-            chunk = firmware_data[offset : offset + chunk_size]
+            chunk = firmware_data[offset : offset + OTA_CHUNK_SIZE]
             frame = bytes([OTA_HDR_DATA]) + seq.to_bytes(4, "little") + chunk
             line = f"[OTA_DATA]{base64.b64encode(frame).decode('ascii')}\n"
             try:
@@ -241,6 +188,11 @@ def send_ota_frames_via_serial(
             offset += len(chunk)
             seq += 1
 
+            # Pace BLE transmissions: the Pico's gatts_notify() queues
+            # BLE notifications and the sensor's NimBLE callback must
+            # process each frame (including esp_ota_write flash operations)
+            # before the next one arrives. Without this delay, the BLE
+            # TX buffer overflows and frames are silently dropped.
             time.sleep(OTA_CHUNK_DELAY)
 
             if seq % 100 == 0:
@@ -262,9 +214,6 @@ def send_ota_frames_via_serial(
             return False, f"Serial write error on OTA_END: {e}"
 
         # --- Wait for ACK from sensor (relayed via Pico serial as [ACK]) ---
-        # The serial read loop in ble_forwarder feeds ack_waiter.set()
-        # when it sees the [ACK] line. This function must NOT be called
-        # from the serial read loop itself — that would deadlock here.
         RNS.log(
             f"[OTA] Waiting for sensor ACK (timeout={OTA_ACK_TIMEOUT}s)...",
             RNS.LOG_INFO,
@@ -291,8 +240,8 @@ def _send_rns_ack(
 ):
     """Send OTA result ACK back to hub via RNS Packet.
 
-    Fallback for when we don't have a Link to the hub — uses a simple
-    Packet to the farm.commands_control destination.
+    This is a fallback for when we don't have a Link to the hub —
+    uses a simple Packet to the farm.commands_control destination.
     """
     payload = {"cmd_id": cmd_id, "status": status}
     if fw_version:
@@ -302,6 +251,7 @@ def _send_rns_ack(
 
     data = json.dumps(payload).encode("utf-8")
 
+    # If hub_dest is an RNS.Destination, send directly
     if hub_dest is not None and hasattr(hub_dest, "send"):
         try:
             pkt = RNS.Packet(hub_dest, data)
