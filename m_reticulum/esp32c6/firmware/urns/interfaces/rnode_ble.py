@@ -1,18 +1,5 @@
-# µReticulum RNode BLE Interface
-# KISS-over-Nordic-UART-Service BLE client for ESP32-C6 — connects to a
-# RAK4631 RNode over BLE and sends/receives RNS packets via KISS framing.
-#
-# Protocol flow:
-#   1. BLE scan for devices advertising the NUS service UUID or named "RNode *"
-#   2. Connect to the matching device
-#   3. Discover the NUS service and its RX/TX characteristics
-#   4. Subscribe to TX characteristic notifications (incoming data)
-#   5. Write KISS-escaped data frames to RX characteristic (outgoing data)
-#   6. Incoming data from TX notifications is KISS-decoded and reassembled
-#      into RNS packets, then passed to process_incoming()
-#
-# This mirrors the official RNS RNodeInterface BLE client, but uses
-# MicroPython's ubluetooth API on ESP32-C6 instead of bleak/Python3.
+# µReticulum RNode BLE Interface - Streamlined & Genuine
+# KISS-over-Nordic-UART-Service BLE client for ESP32-C6
 
 import gc
 import struct
@@ -23,121 +10,55 @@ import ubluetooth as bt
 from ..log import LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, log
 from . import Interface
 
-# ---------------------------------------------------------------------------
-# ubluetooth IRQ event constants (MicroPython ESP32-C6)
-# ---------------------------------------------------------------------------
-_IRQ_CENTRAL_CONNECT = 1
-_IRQ_CENTRAL_DISCONNECT = 2
-_IRQ_GATTS_WRITE = 3
-_IRQ_GATTS_READ_REQUEST = 4
-_IRQ_SCAN_RESULT = 5
-_IRQ_SCAN_DONE = 6
-_IRQ_PERIPHERAL_CONNECT = 7
-_IRQ_PERIPHERAL_DISCONNECT = 8
-_IRQ_GATTC_SERVICE_RESULT = 9
-_IRQ_GATTC_SERVICE_DONE = 10
-_IRQ_GATTC_CHARACTERISTIC_RESULT = 11
-_IRQ_GATTC_CHARACTERISTIC_DONE = 12
-_IRQ_GATTC_DESCRIPTOR_RESULT = 13
-_IRQ_GATTC_DESCRIPTOR_DONE = 14
-_IRQ_GATTC_READ_RESULT = 15
-_IRQ_GATTC_READ_DONE = 16
-_IRQ_GATTC_WRITE_DONE = 17
-_IRQ_GATTC_NOTIFY = 18
-_IRQ_GATTC_INDICATE = 19
-_IRQ_GATTS_INDICATE_DONE = 20
-_IRQ_MTU_EXCHANGED = 21
-_IRQ_CONNECTION_UPDATE = 27
-_IRQ_ENCRYPTION_UPDATE = 28
-_IRQ_PASSKEY_ACTION = 31
+_IRQ_SCAN_RESULT, _IRQ_SCAN_DONE = 5, 6
+_IRQ_PERIPHERAL_CONNECT, _IRQ_PERIPHERAL_DISCONNECT = 7, 8
+_IRQ_GATTC_SERVICE_RESULT, _IRQ_GATTC_SERVICE_DONE = 9, 10
+_IRQ_GATTC_CHARACTERISTIC_RESULT, _IRQ_GATTC_CHARACTERISTIC_DONE = 11, 12
+_IRQ_GATTC_DESCRIPTOR_RESULT, _IRQ_GATTC_DESCRIPTOR_DONE = 13, 14
+_IRQ_GATTC_WRITE_DONE, _IRQ_GATTC_NOTIFY = 17, 18
+_IRQ_MTU_EXCHANGED, _IRQ_ENCRYPTION_UPDATE = 21, 28
+_IRQ_GET_SECRET, _IRQ_SET_SECRET, _IRQ_PASSKEY_ACTION = 29, 30, 31
 
-# Passkey action types for _IRQ_PASSKEY_ACTION
-# These match MicroPython's official constants
-_PASSKEY_ACTION_INPUT = 2  # Client should enter the passkey displayed on the server
-_PASSKEY_ACTION_DISPLAY = (
-    3  # Client should display a passkey for the user to enter on the server
-)
-_PASSKEY_ACTION_NUMERIC_COMPARISON = (
-    4  # Client should confirm the numeric comparison matches
-)
-
-# BLE IO capability types for BLE.config('io')
+_PASSKEY_ACTION_INPUT = 2
 _IO_CAPABILITY_DISPLAY_ONLY = 0
 _IO_CAPABILITY_DISPLAY_YESNO = 1
 _IO_CAPABILITY_KEYBOARD_ONLY = 2
 _IO_CAPABILITY_NO_INPUT_OUTPUT = 3
 _IO_CAPABILITY_KEYBOARD_DISPLAY = 4
 
-# ---------------------------------------------------------------------------
-# BLE constants
-# ---------------------------------------------------------------------------
-_BLE_SCAN_INTERVAL_US = 30000  # 30 ms active scan interval
-_BLE_SCAN_WINDOW_US = 30000  # 30 ms active scan window
+UART_SERVICE_UUID = bt.UUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
+UART_RX_CHAR_UUID = bt.UUID("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
+UART_TX_CHAR_UUID = bt.UUID("6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
+_UART_SERVICE_UUID_STR = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 
-# Nordic UART Service (NUS) UUIDs
-UART_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-UART_RX_CHAR_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  # Client writes to this
-UART_TX_CHAR_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  # Client reads notifications
+FEND, FESC, TFEND, TFESC = 0xC0, 0xDB, 0xDC, 0xDD
+CMD_DATA, CMD_FREQUENCY, CMD_BANDWIDTH, CMD_TXPOWER, CMD_SF, CMD_CR, CMD_RADIO_STATE = (
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+)
+(
+    CMD_DETECT,
+    CMD_READY,
+    CMD_STAT_RSSI,
+    CMD_STAT_SNR,
+    CMD_STAT_BAT,
+    CMD_PLATFORM,
+    CMD_MCU,
+    CMD_FW_VERSION,
+) = 8, 15, 35, 36, 39, 72, 73, 80
+RADIO_STATE_OFF, RADIO_STATE_ON, DETECT_REQ, DETECT_ACK = 0, 1, 0x73, 0x46
 
-# ---------------------------------------------------------------------------
-# KISS protocol constants
-# ---------------------------------------------------------------------------
-FEND = 0xC0
-FESC = 0xDB
-TFEND = 0xDC
-TFESC = 0xDD
 
-CMD_DATA = 0x00
-CMD_FREQUENCY = 0x01
-CMD_BANDWIDTH = 0x02
-CMD_TXPOWER = 0x03
-CMD_SF = 0x04
-CMD_CR = 0x05
-CMD_RADIO_STATE = 0x06
-CMD_RADIO_LOCK = 0x07
-CMD_DETECT = 0x08
-CMD_LEAVE = 0x0A
-CMD_READY = 0x0F
-CMD_STAT_RX = 0x21
-CMD_STAT_TX = 0x22
-CMD_STAT_RSSI = 0x23
-CMD_STAT_SNR = 0x24
-CMD_STAT_BAT = 0x27
-CMD_RANDOM = 0x40
-CMD_PLATFORM = 0x48
-CMD_MCU = 0x49
-CMD_FW_VERSION = 0x50
-CMD_RESET = 0x55
-
-# BLE control commands (used for serial-assisted auto-pairing)
-CMD_BT_CTRL = 0x46
-CMD_BT_PIN = 0x62
-CMD_BT_ON = 0x01  # Sub-value for CMD_BT_CTRL: enable Bluetooth
-CMD_BT_OFF = 0x00  # Sub-value for CMD_BT_CTRL: disable Bluetooth
-CMD_BT_PAIR = 0x02  # Sub-value for CMD_BT_CTRL: enter pairing mode
-
-# Radio states
-RADIO_STATE_OFF = 0x00
-RADIO_STATE_ON = 0x01
-RADIO_STATE_ASK = 0xFF
-
-# Detection byte values — must match official RNode firmware
-DETECT_REQ = 0x73
-DETECT_ACK = 0x46
-
-# BLE MTU — requested MTU for negotiation (ESP32-C6 supports up to 247)
-_BLE_MTU_REQUEST = 247
-
-# Default radio parameters (868 MHz EU band)
-_DEFAULT_FREQUENCY = 868000000
-_DEFAULT_BANDWIDTH = 125000
-_DEFAULT_TXPOWER = 17
-_DEFAULT_SF = 11
-_DEFAULT_CR = 5
+def diag_print(msg):
+    print("[RNode BLE] " + str(msg))
 
 
 def _kiss_escape(data):
-    """Escape bytes for KISS framing: 0xDB → 0xDB 0xDD, 0xC0 → 0xDB 0xDC."""
     out = bytearray()
     for b in data:
         if b == 0xDB:
@@ -149,1580 +70,802 @@ def _kiss_escape(data):
     return bytes(out)
 
 
-def _kiss_unescape(data):
-    """Unescape KISS bytes: 0xDB 0xDD → 0xDB, 0xDB 0xDC → 0xC0."""
-    out = bytearray()
-    i = 0
-    while i < len(data):
-        if data[i] == 0xDB and i + 1 < len(data):
-            if data[i + 1] == 0xDD:
-                out.append(0xDB)
-                i += 2
-                continue
-            elif data[i + 1] == 0xDC:
-                out.append(0xC0)
-                i += 2
-                continue
-        out.append(data[i])
-        i += 1
-    return bytes(out)
-
-
 class RNodeBLEInterface(Interface):
-    """KISS-over-BLE RNode interface for µReticulum.
-
-    Connects to a RAK4631 RNode via the Nordic UART Service (NUS) BLE GATT
-    profile.  The RNode exposes NUS when BLE is enabled with
-    ``rnodeconf --bluetooth-on``.
-
-    Data is KISS-framed over the NUS UART: outgoing RNS packets are escaped
-    and wrapped in KISS DATA frames before writing to the RX characteristic;
-    incoming TX notifications are KISS-decoded and reassembled into RNS
-    packets that are fed to process_incoming().
-    """
-
-    # Maximum RNS packet we'll reassemble
     MAX_REASSEMBLY = 4096
 
     def __init__(self, config):
-        name = config.get("name", "RNode BLE")
-        super().__init__(name)
-
-        # ----- Radio configuration -----
-        self.frequency = config.get("frequency", _DEFAULT_FREQUENCY)
-        self.bandwidth = config.get("bandwidth", _DEFAULT_BANDWIDTH)
-        self.txpower = config.get("txpower", _DEFAULT_TXPOWER)
-        self.spreadingfactor = config.get("spreadingfactor", _DEFAULT_SF)
-        self.codingrate = config.get("codingrate", _DEFAULT_CR)
-
-        # ----- BLE target configuration -----
+        super().__init__(config.get("name", "RNode BLE"))
+        self.frequency = config.get("frequency", 868000000)
+        self.bandwidth = config.get("bandwidth", 125000)
+        self.txpower = config.get("txpower", 17)
+        self.spreadingfactor = config.get("spreadingfactor", 11)
+        self.codingrate = config.get("codingrate", 5)
         self.target_name = config.get("target_name", "")
         self.target_address = config.get("target_address", None)
         self.scan_timeout = config.get("scan_timeout", 10)
         self.reconnect_delay = config.get("reconnect_delay", 5)
-
-        # Pairing passkey for official RNode firmware (RAK4631 nRF52).
-        # The RNode requires MITM-protected pairing with a passkey.
-        #
-        # Pairing flow:
-        #   1. Put RNode in pairing mode: rnodeconf --bluetooth-on or button
-        #   2. RNode displays a random 6-digit PIN on its screen
-        #   3. Set pairing_passkey to that PIN
-        #   4. ESP32-C6 connects, pairs using the PIN, RNode disconnects us
-        #   5. ESP32-C6 reconnects — bond is stored, no PIN needed after first pair
-        #   6. Set pairing_passkey back to 0 after successful first pair
-        #
-        # For third-party BLE bridges (Heltec V3 RTReticulum) that use
-        # Just Works pairing, leave this at 0.
-        self.pairing_passkey = config.get("pairing_passkey", 0)
-
-        # Serial port for automatic pairing assistance.
-        # When set, the interface can automatically put the RNode into
-        # pairing mode and read the PIN via its USB serial KISS interface,
-        # eliminating the need for manual PIN configuration.
-        self.serial_port = config.get("serial_port", None)
-
-        # Automatic pairing state
-        self._auto_pairing_in_progress = False
-        self._serial_pairing_pin = None  # PIN obtained from serial KISS
-        self._serial_pairing_attempts = 0
-        self._max_serial_pairing_attempts = 3
-
-        self.bitrate = config.get("bitrate", 250000)
-
-        # ----- BLE state -----
-        self._ble = None
-        self._conn_handle = None
-        self._rx_char_handle = None  # Client writes data here
-        self._tx_char_handle = None  # Client reads notifications here
-        self._service_handle = None  # (start, end) handle range
-
-        # Scanning
-        self._scanning = False
-        self._target_addr_found = None  # (addr_type, addr_bytes)
-        self._scan_result = None  # None=pending, True=found, False=timeout
-
-        # Connection state machine
-        self._connecting = False
-        self._discovering = False
-        self._subscribing = False
-        self._service_discovered = False
-        self._char_discovered = False
-        self._desc_discovered = False
-        self._notify_enabled = False
-        self._cccd_handle = None  # CCCD descriptor handle for TX characteristic
-
-        # ----- KISS state -----
-        self._kiss_buf = bytearray()  # Incoming KISS reassembly buffer
-        self._in_frame = False  # Between FEND delimiters
-        self._escaping = False  # Processing escape sequence
-        self._current_cmd = None  # Current KISS command byte
-
-        # ----- Detection handshake -----
-        self._detected = False
-        self._detect_retries = 0
-        self._max_detect_retries = 3
-
-        # ----- MTU -----
-        self._negotiated_mtu = 23  # Default BLE ATT MTU before exchange
-        self._mtu_exchanged = False  # True after _IRQ_MTU_EXCHANGED fires
-        self._encrypted = False  # True after _IRQ_ENCRYPTION_UPDATE fires
-
-        # ----- Radio config state -----
-        self._radio_configured = False
-
-        # ----- Statistics -----
-        self.rssi = None
-        self.snr = None
-        self.battery_level = None
-        self.rnode_platform = None
-        self.rnode_mcu = None
-        self.rnode_fw_version = None
-
-        # ----- Outgoing write queue -----
-        self._write_queue = []
-
-        # ----- Reconnection tracking -----
-        self._reconnect_count = 0
-        self._last_reconnect = 0
+        self.pairing_passkey = 0
+        self._secrets = {}
+        self._secrets_dirty = False
+        self._bonded_dirty = False
         self._shutting_down = False
-        self._pairing_attempted = False
-        self._detect_sent_time = 0
+        self._already_bonded = False
 
-        # ----- Initialize BLE -----
+        # Check if successfully bonded from a previous run
+        try:
+            with open("bonded.txt", "r") as f:
+                if f.read().strip() == "1":
+                    self._already_bonded = True
+                    diag_print(
+                        "Device is already bonded. Skipping manual pairing on connection."
+                    )
+        except Exception:
+            pass
+
+        # Load PIN from ble_pin.txt
+        try:
+            with open("ble_pin.txt", "r") as f:
+                self.pairing_passkey = int(f.read().strip())
+            diag_print("Loaded fresh PIN {:06d}".format(self.pairing_passkey))
+        except Exception as e:
+            diag_print("No PIN loaded: " + str(e))
+
+        # Check if the Mac pairing script is forcing a fresh pairing session
+        force_pair = False
+        try:
+            with open("force_pair.txt", "r") as f:
+                if f.read().strip() == "1":
+                    force_pair = True
+        except Exception:
+            pass
+
+        if force_pair:
+            diag_print(
+                "Fresh pairing session forced by Mac script. Clearing stale bonds."
+            )
+            try:
+                import os
+
+                os.remove("ble_bond.json")
+                os.remove("bonded.txt")
+                os.remove("force_pair.txt")
+                self._already_bonded = False
+            except Exception:
+                pass
+
+        # Load or generate a persistent local MAC address.
+        # This prevents the C6 from randomizing its MAC every boot, allowing the RNode to reuse bonds.
+        temp_mac = None
+        try:
+            with open("ble_mac.txt", "r") as f:
+                temp_mac = bytes.fromhex(f.read().strip())
+            diag_print(
+                "Loaded persistent MAC: " + ":".join("%02x" % b for b in temp_mac)
+            )
+        except Exception:
+            try:
+                import random
+
+                import network
+
+                wlan = network.WLAN(network.STA_IF)
+                wlan.active(True)
+                hw_mac = wlan.config("mac")
+                # Create a locally-administered MAC using a variation of the hardware MAC
+                # First byte must be 0x02 to satisfy driver constraints.
+                temp_mac = bytearray(hw_mac)
+                temp_mac[0] = 0x02
+                with open("ble_mac.txt", "w") as f:
+                    f.write(temp_mac.hex())
+                diag_print(
+                    "Generated persistent MAC: "
+                    + ":".join("%02x" % b for b in temp_mac)
+                )
+            except Exception as e:
+                diag_print("Failed to generate persistent MAC: " + str(e))
+
+        if temp_mac:
+            try:
+                import network
+
+                wlan = network.WLAN(network.STA_IF)
+                wlan.active(True)
+                wlan.config(mac=temp_mac)
+            except Exception as e:
+                diag_print("MAC override failed: " + str(e))
+
         try:
             self._ble = bt.BLE()
+
+            # Always activate the BLE controller BEFORE configuring parameters.
             self._ble.active(True)
-            # Request a larger MTU before any connections — ESP32-C6 supports up to 247.
-            # The actual negotiated MTU will be confirmed by _IRQ_MTU_EXCHANGED.
-            self._ble.config(mtu=_BLE_MTU_REQUEST)
-            # Enable bonding and set security for pairing with the RNode.
-            # The official RNode firmware (RAK4631 nRF52) requires MITM-protected
-            # pairing (SECMODE_ENC_WITH_MITM) with a passkey.
-            # We configure:
-            #   bond=True — store pairing keys persistently
-            #   mitm=True — require MITM protection (passkey entry)
-            #   io=KEYBOARD_ONLY — we can enter a passkey displayed by the RNode
-            #   le_secure=True — use LE Secure Connections (required by nRF52)
-            #
-            # For third-party BLE bridges (Heltec V3) that use Just Works,
-            # these settings won't cause problems — they just won't trigger a
-            # passkey challenge since the bridge doesn't require MITM.
+
+            # Enforce Legacy MITM Bonding parameters globally.
             self._ble.config(bond=True)
-            # MITM and IO capability configuration for official RNode pairing.
-            # The nRF52 RNode uses Display Only IO caps and requires MITM.
-            # We set KEYBOARD_ONLY so we can enter the passkey.
-            # If pairing_passkey is 0 (third-party bridge), these settings
-            # don't cause issues since Just Works bridges don't require pairing.
-            self._ble.config(mitm=True)
-            self._ble.config(io=_IO_CAPABILITY_KEYBOARD_ONLY)
+            if self.pairing_passkey:
+                diag_print(
+                    "Configuring security: mitm=True, keyboard_only, le_secure=False"
+                )
+                self._ble.config(
+                    mitm=True, io=_IO_CAPABILITY_KEYBOARD_ONLY, le_secure=False
+                )
+            else:
+                self._ble.config(mitm=False, io=_IO_CAPABILITY_NO_INPUT_OUTPUT)
+
+            self._ble.config(mtu=247)
             self._ble.irq(self._irq)
-            log("RNode BLE " + self.name + " initialized", LOG_NOTICE)
+            diag_print("BLE controller activated successfully")
         except Exception as e:
-            log("RNode BLE init failed: " + str(e), LOG_ERROR)
+            diag_print("Init failed: " + str(e))
             self._ble = None
             return
 
-        # Trigger initial scan+connect cycle
+        self._conn_handle = self._rx_char_handle = self._tx_char_handle = (
+            self._service_handle
+        ) = self._cccd_handle = None
+        self._scanning = self._connecting = self._discovering = self._subscribing = (
+            False
+        )
+        self._service_discovered = self._char_discovered = self._desc_discovered = (
+            self._notify_enabled
+        ) = self._mtu_exchanged = self._encrypted = self._pairing_attempted = (
+            self._pending_pair
+        ) = False
+        self._kiss_buf = bytearray()
+        self._in_frame = self._escaping = False
+        self._current_cmd = None
+        self._detected = self._radio_configured = False
+        self._detect_retries = 0
+        self._write_queue = []
+        self._reconnect_count = 0
+        self._last_reconnect = 0
+        self._detect_sent_time = 0
+        self._pairing_start_time = 0
+        self._negotiated_mtu = 23
+
+        self._load_secrets()
         self._start_scan()
 
-    # ==================================================================
-    # Serial-Assisted Auto-Pairing
-    # ==================================================================
-
-    def _serial_pair(self):
-        """Automatically obtain a pairing PIN from the RNode via USB serial.
-
-        Opens the RNode's serial port, sends CMD_BT_CTRL 0x02 to trigger
-        pairing mode, reads the CMD_BT_PIN response containing the random
-        6-digit PIN, and updates self.pairing_passkey.
-
-        Returns True if a PIN was obtained, False otherwise.
-        """
-        if not self.serial_port:
-            log("RNode BLE auto-pairing: no serial_port configured", LOG_WARNING)
-            return False
-
-        if self._serial_pairing_attempts >= self._max_serial_pairing_attempts:
-            log(
-                "RNode BLE auto-pairing: max attempts ("
-                + str(self._max_serial_pairing_attempts)
-                + ") reached",
-                LOG_ERROR,
-            )
-            return False
-
-        self._serial_pairing_attempts += 1
-        log(
-            "RNode BLE auto-pairing: attempting via serial (attempt "
-            + str(self._serial_pairing_attempts)
-            + ")",
-            LOG_NOTICE,
-        )
-
+    def _load_secrets(self):
         try:
-            from machine import UART
+            import json
 
-            # Use UART 1 for serial KISS communication with the RNode.
-            # The default UART 0 is used by the REPL.
-            uart_id = 1
-            serial = UART(uart_id, 115200)
-        except Exception as e:
-            log("RNode BLE auto-pairing: UART init failed: " + str(e), LOG_ERROR)
-            return False
+            with open("ble_bond.json", "r") as f:
+                raw = json.load(f)
+            self._secrets = {}
+            for k, v in raw.items():
+                parts = k.split(",")
+                # Strictly restore both key and value as plain bytes objects
+                self._secrets[(int(parts[0]), bytes.fromhex(parts[1]))] = bytes.fromhex(
+                    v
+                )
+        except Exception:
+            pass
 
+    def _save_secrets(self):
         try:
-            # Step 1: Send CMD_BT_CTRL with CMD_BT_PAIR to trigger pairing mode
-            pair_cmd = bytes([FEND, CMD_BT_CTRL, CMD_BT_PAIR, FEND])
-            serial.write(pair_cmd)
-            log("RNode BLE auto-pairing: sent CMD_BT_CTRL PAIR via serial", LOG_NOTICE)
+            import json
 
-            # Step 2: Wait for CMD_BT_PIN response (up to 10 seconds).
-            # The RNode responds with a KISS frame: FEND CMD_BT_PIN <4 bytes PIN> FEND
-            # The 4 bytes are a big-endian 32-bit integer (the 6-digit PIN).
-            buf = bytearray()
-            in_frame = False
-            pin_data = None
-            deadline = time.time() + 10  # 10 second timeout
+            raw = {}
+            for k, v in self._secrets.items():
+                # Save as pure hex string to enforce compliant byte serialization
+                raw["{},{}".format(k[0], k[1].hex())] = v.hex()
+            with open("ble_bond.json", "w") as f:
+                json.dump(raw, f)
+        except Exception:
+            pass
 
-            while time.time() < deadline:
-                if serial.any():
-                    b = serial.read(1)
-                    if b:
-                        b = b[0]
-                        if b == FEND:
-                            if in_frame and len(buf) >= 1:
-                                cmd_byte = buf[0]
-                                if cmd_byte == CMD_BT_PIN and len(buf) >= 5:
-                                    # Parse the 4-byte big-endian PIN
-                                    pin_data = buf[1:5]
-                                    break
-                            # Start new frame
-                            in_frame = True
-                            buf = bytearray()
-                        elif in_frame:
-                            buf.append(b)
-                else:
-                    time.sleep_ms(10)
+    def _on_get_secret(self, data):
+        sec_type, index, key = data[0], data[1], data[2]
+        if key is None:
+            # Index-based query: Return the index'th bytes secret value for this sec_type, or None
+            i = 0
+            for (s, k), v in self._secrets.items():
+                if s == sec_type:
+                    if i == index:
+                        return v
+                    i += 1
+            return None
+        else:
+            # Direct key query: key is passed as a memoryview, cast to bytes for dict lookup
+            key_bytes = bytes(key)
+            return self._secrets.get((sec_type, key_bytes), None)
 
-            # Deinitialize the UART — we only need it for pairing
-            serial.deinit()
+    def _on_set_secret(self, data):
+        sec_type, key, value = data[0], data[1], data[2]
+        key_bytes = bytes(key)
+        value_bytes = bytes(value) if value is not None else None
 
-            if pin_data is not None:
-                pin = (
-                    (pin_data[0] << 24)
-                    | (pin_data[1] << 16)
-                    | (pin_data[2] << 8)
-                    | pin_data[3]
-                )
-                log(
-                    "RNode BLE auto-pairing: obtained PIN "
-                    + "{:06d}".format(pin)
-                    + " from RNode",
-                    LOG_NOTICE,
-                )
-                self.pairing_passkey = pin
-                self._serial_pairing_pin = pin
-                return True
-            else:
-                log(
-                    "RNode BLE auto-pairing: no CMD_BT_PIN response received",
-                    LOG_ERROR,
-                )
-                return False
-
-        except Exception as e:
-            try:
-                serial.deinit()
-            except:
-                pass
-            log("RNode BLE auto-pairing error: " + str(e), LOG_ERROR)
-            return False
-
-    # ==================================================================
-    # BLE Scanning
-    # ==================================================================
+        if value_bytes is None:
+            if (sec_type, key_bytes) in self._secrets:
+                del self._secrets[(sec_type, key_bytes)]
+                self._secrets_dirty = True
+        else:
+            self._secrets[(sec_type, key_bytes)] = value_bytes
+            self._secrets_dirty = True
+        return True
 
     def _start_scan(self):
-        """Start scanning for RNode devices."""
         if not self._ble or self._shutting_down:
             return
-
-        self._target_addr_found = None
-        self._scan_result = None
-        self._scanning = True
-
+        self._target_addr_found = self._scan_result = None
+        self._scanning, self._scan_start_time = True, time.time()
         try:
-            self._ble.gap_scan(
-                self.scan_timeout * 1000,
-                _BLE_SCAN_INTERVAL_US,
-                _BLE_SCAN_WINDOW_US,
-                True,  # active scan
-            )
-            target_desc = (
-                "'" + self.target_name + "'" if self.target_name else "any RNode"
-            )
-            log("RNode BLE scanning for " + target_desc, LOG_VERBOSE)
+            self._ble.gap_scan(self.scan_timeout * 1000, 100000, 30000, True)
+            diag_print("Scanning...")
         except Exception as e:
-            log("RNode BLE scan start failed: " + str(e), LOG_ERROR)
+            diag_print("Scan failed: " + str(e))
             self._scanning = False
-            self._scan_result = False
 
     def _stop_scan(self):
-        """Stop an active scan."""
         if self._scanning and self._ble:
             try:
                 self._ble.gap_scan(None)
-            except:
+            except Exception:
                 pass
             self._scanning = False
 
     def _decode_adv_data(self, adv_data):
-        """Decode BLE advertising data to extract service UUIDs and device name.
-
-        Returns (services, name) where services is a list of UUID strings
-        and name is the decoded device name or None.
-        """
-        services = []
-        name = None
-        i = 0
+        services, name, i = [], None, 0
         while i + 1 < len(adv_data):
             length = adv_data[i]
             if length == 0 or i + length + 1 > len(adv_data):
                 break
-            ad_type = adv_data[i + 1]
-            field_data = bytes(adv_data[i + 2 : i + 1 + length])
-
-            # Complete 128-bit service UUID list (AD type 0x07)
-            # BLE advertising sends 128-bit UUIDs little-endian — reverse bytes before formatting
-            if ad_type == 0x07:
-                for j in range(0, len(field_data), 16):
-                    if j + 16 <= len(field_data):
-                        uuid_bytes = bytes(reversed(field_data[j : j + 16]))
-                        uuid_hex = uuid_bytes.hex()
-                        uuid_str = (
-                            uuid_hex[0:8]
-                            + "-"
-                            + uuid_hex[8:12]
-                            + "-"
-                            + uuid_hex[12:16]
-                            + "-"
-                            + uuid_hex[16:20]
-                            + "-"
-                            + uuid_hex[20:32]
+            ad_type, field = adv_data[i + 1], bytes(adv_data[i + 2 : i + 1 + length])
+            if ad_type in (0x06, 0x07):
+                for j in range(0, len(field), 16):
+                    if j + 16 <= len(field):
+                        b = bytes(reversed(field[j : j + 16]))
+                        services.append(
+                            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}".format(
+                                int.from_bytes(b[0:4], "big"),
+                                int.from_bytes(b[4:6], "big"),
+                                int.from_bytes(b[6:8], "big"),
+                                int.from_bytes(b[8:10], "big"),
+                                int.from_bytes(b[10:16], "big"),
+                            )
                         )
-                        services.append(uuid_str)
-            # Complete local name (AD type 0x09)
-            elif ad_type == 0x09:
+            elif ad_type in (0x08, 0x09) and name is None:
                 try:
-                    name = field_data.decode("utf-8")
+                    name = field.decode("utf-8")
                 except Exception:
-                    name = field_data.decode("latin-1")
-            # Shortened local name (AD type 0x08)
-            elif ad_type == 0x08 and name is None:
-                try:
-                    name = field_data.decode("utf-8")
-                except Exception:
-                    pass
-
+                    name = field.decode("latin-1")
             i += length + 1
-
         return services, name
 
     def _match_scan_result(self, addr_type, addr, adv_data):
-        """Check if a scan result matches our target RNode device.
-
-        Matching logic:
-          1. If target_address is configured, match on MAC address only.
-          2. If target_name is configured (non-empty), match on NUS service UUID
-             AND device name.
-          3. Auto-discovery (target_name empty): match any device advertising
-             the NUS service UUID OR whose name starts with "RNode ".
-        """
-        # Match by MAC address if configured
+        addr_str = ":".join("%02x" % b for b in addr)
         if self.target_address:
-            addr_str = ":".join(("%02x" % b) for b in addr)
-            if addr_str.lower() == self.target_address.lower():
-                return True
-            return False
-
+            return addr_str.lower() == self.target_address.lower()
         services, name = self._decode_adv_data(adv_data)
-        nus_uuid_lower = UART_SERVICE_UUID.lower()
-        has_nus = nus_uuid_lower in [s.lower() for s in services]
-
-        # Auto-discovery: match any device with NUS service or name starting with "RNode "
-        if not self.target_name:
-            if has_nus:
-                return True
-            if name is not None and name.startswith("RNode "):
-                return True
-            return False
-
-        # Explicit target_name: match on NUS service UUID AND device name
-        service_match = has_nus
-        name_match = name is not None and name == self.target_name
-
-        return service_match and name_match
-
-    # ==================================================================
-    # BLE Connection
-    # ==================================================================
+        has_nus = _UART_SERVICE_UUID_STR in [s.lower() for s in services]
+        if self.target_name:
+            return has_nus and (
+                name == self.target_name or (name and name.startswith(self.target_name))
+            )
+        return has_nus or (name and name.startswith("RNode"))
 
     def _on_connect(self, data):
-        """Handle _IRQ_PERIPHERAL_CONNECT: we connected to the RNode.
-
-        Connection flow depends on the target RNode's security requirements:
-
-        - Third-party BLE bridges (Heltec V3, etc.) use Just Works pairing
-          (sm_mitm=0). No pairing is needed — we proceed directly to MTU
-          exchange and service discovery.
-
-        - Official RNode firmware (RAK4631 nRF52) requires MITM-protected pairing
-          (SECMODE_ENC_WITH_MITM). We must call gap_pair() and provide the
-          passkey configured in `pairing_passkey`.
-
-        The strategy is:
-          1. If pairing_passkey is configured, call gap_pair() immediately
-             to start the pairing process. The _IRQ_PASSKEY_ACTION handler
-             will respond with the configured passkey.
-          2. If pairing_passkey is 0 (default), skip pairing and proceed
-             directly. If the CCCD write fails with a security error,
-             we'll attempt pairing then.
-        """
-        conn_handle, _, _ = data
-        self._conn_handle = conn_handle
-        self._connecting = False
-        self._service_discovered = False
-        self._char_discovered = False
-        self._desc_discovered = False
-        self._notify_enabled = False
-        self._mtu_exchanged = False
-        self._negotiated_mtu = 23  # Reset to BLE default before MTU exchange
-        self._encrypted = False
-        self._pairing_attempted = False
-        self._rx_char_handle = None
-        self._tx_char_handle = None
-        self._cccd_handle = None
-        self._detect_sent_time = 0
-        self._serial_pairing_attempts = 0
-        # _discovering stays False until poll_loop starts discovery
-        log("RNode BLE connected (handle=" + str(conn_handle) + ")", LOG_NOTICE)
-
-        # If a pairing passkey is configured (or dynamically obtained from
-        # serial auto-pairing), initiate pairing immediately.
-        # This is needed for official RNode firmware (RAK4631) which requires
-        # MITM-protected pairing (SECMODE_ENC_WITH_MITM).
-        # On reconnect after successful pairing, the bond is already stored
-        # so gap_pair() would be redundant — but it's harmless to call.
-        pin = self.pairing_passkey or self._serial_pairing_pin
-        if pin:
-            try:
-                self._ble.gap_pair(conn_handle)
-                self._pairing_attempted = True
-                log(
-                    "RNode BLE pairing initiated (passkey="
-                    + "{:06d}".format(pin)
-                    + ")",
-                    LOG_NOTICE,
-                )
-            except Exception as e:
-                log("RNode BLE pair failed: " + str(e), LOG_WARNING)
-        elif self.serial_port and not self._auto_pairing_in_progress:
-            # No passkey configured but serial port available — try auto-pairing.
-            # We'll connect first, and if pairing fails (which it will since
-            # RNode requires MITM), the disconnect handler will trigger
-            # auto-pairing via serial.
-            log(
-                "RNode BLE no passkey configured but serial_port available — "
-                "will auto-pair on disconnect if needed",
-                LOG_NOTICE,
-            )
+        self._conn_handle, self._connecting = data[0], False
+        self._service_discovered = self._char_discovered = self._desc_discovered = (
+            self._notify_enabled
+        ) = self._mtu_exchanged = self._encrypted = self._pairing_attempted = False
+        self._pending_pair = bool(self.pairing_passkey and not self._already_bonded)
+        self._rx_char_handle = self._tx_char_handle = self._service_handle = (
+            self._cccd_handle
+        ) = None
+        self._pairing_start_time = 0
+        diag_print("Connected! Handle={}".format(self._conn_handle))
 
     def _on_disconnect(self, data):
-        """Handle _IRQ_PERIPHERAL_DISCONNECT: lost connection to RNode.
-
-        The official RNode firmware (nRF52) disconnects the client after
-        successful pairing. This is by design — after pairing, we must
-        reconnect with the stored bond. We detect this case by checking
-        if we were in the middle of pairing but hadn't completed service
-        discovery yet.
-        """
-        conn_handle, addr_type, addr = data
-        addr_str = ":".join(("%02x" % b) for b in addr)
-        log(
-            "RNode BLE disconnected (handle="
-            + str(conn_handle)
-            + ", addr="
-            + addr_str
-            + ")",
-            LOG_NOTICE,
+        diag_print("Disconnected!")
+        self._last_reconnect = time.time() - (
+            self.reconnect_delay
+            if self._encrypted or self._already_bonded or len(self._secrets) > 0
+            else 0
         )
-
-        # Auto-pairing: if pairing failed (not encrypted, service not discovered)
-        # and we have a serial port configured, try to obtain the PIN automatically
-        # from the RNode's USB serial KISS interface.
-        if (
-            self._pairing_attempted
-            and not self._encrypted
-            and not self._service_discovered
-            and self.serial_port
-            and not self._auto_pairing_in_progress
-        ):
-            log(
-                "RNode BLE pairing failed — attempting auto-pairing via serial",
-                LOG_NOTICE,
-            )
-            self._auto_pairing_in_progress = True
-            try:
-                if self._serial_pair():
-                    # Got a PIN from serial, retry BLE connection quickly
-                    self._last_reconnect = time.time() - self.reconnect_delay + 1.0
-                else:
-                    self._last_reconnect = time.time()
-            except Exception as e:
-                log("RNode BLE auto-pairing exception: " + str(e), LOG_ERROR)
-                self._last_reconnect = time.time()
-            self._auto_pairing_in_progress = False
-        elif self._pairing_attempted and not self._service_discovered:
-            log(
-                "RNode BLE disconnected after pairing — bond stored, reconnecting",
-                LOG_NOTICE,
-            )
-            # Short reconnect delay since the bond is already stored
-            self._last_reconnect = time.time() - self.reconnect_delay + 1.0
-        else:
-            self._last_reconnect = time.time()
-
-        self._conn_handle = None
-        self._rx_char_handle = None
-        self._tx_char_handle = None
-        self._service_handle = None
-        self._service_discovered = False
-        self._char_discovered = False
-        self._desc_discovered = False
-        self._notify_enabled = False
-        self._mtu_exchanged = False
-        self._encrypted = False
-        self._connecting = False
-        self._discovering = False
-        self._subscribing = False
-        self._cccd_handle = None
-        # Don't reset _pairing_attempted — we may still need it on reconnect
+        self._conn_handle = self._rx_char_handle = self._tx_char_handle = (
+            self._service_handle
+        ) = self._cccd_handle = None
+        self._connecting = self._discovering = self._subscribing = self.online = (
+            self._detected
+        ) = self._radio_configured = False
+        self._mtu_exchanged = self._encrypted = self._pairing_attempted = False
+        self._service_discovered = self._char_discovered = self._desc_discovered = (
+            self._notify_enabled
+        ) = False
+        self._detect_retries = 0
         self._detect_sent_time = 0
-        self.online = False
-        self._detected = False
-        self._radio_configured = False
-
-        # Clear KISS state
         self._kiss_buf = bytearray()
-        self._in_frame = False
-        self._escaping = False
-        self._current_cmd = None
-
-        # Clear write queue
         self._write_queue = []
 
-        if not self._shutting_down:
-            pass  # _last_reconnect already set above
-
     def _on_passkey_action(self, action, passkey):
-        """Handle _IRQ_PASSKEY_ACTION: respond to BLE pairing challenges.
-
-        The official RNode firmware (RAK4631 nRF52) uses Display Only IO
-        capability (setIOCaps(true, false, false)), which means the RNode
-        displays a passkey and the client must enter it.
-
-        We configure our IO capability as KEYBOARD_ONLY so the RNode
-        knows we can enter a passkey.
-
-        Pairing flow:
-          1. User puts RNode into pairing mode (rnodeconf --bluetooth-on or button)
-          2. RNode displays a random 6-digit PIN
-          3. We call gap_pair() which triggers _IRQ_PASSKEY_ACTION with
-             action=_PASSKEY_ACTION_INPUT
-          4. We respond with gap_passkey(conn_handle, action, pin) using
-             the configured pairing_passkey
-          5. After successful pairing, the RNode disconnects us (by design)
-          6. We reconnect — the bond is stored, no PIN needed anymore
-
-        For third-party BLE bridges (Heltec V3) that use Just Works,
-        no passkey action is triggered.
-        """
-        log(
-            "RNode BLE passkey action: action="
-            + str(action)
-            + " passkey="
-            + str(passkey),
-            LOG_NOTICE,
-        )
-
         if action == _PASSKEY_ACTION_INPUT:
-            # RNode is displaying a passkey and we must enter it.
-            # Use dynamically obtained PIN (from serial auto-pairing) or
-            # the statically configured pairing_passkey.
-            pin = self.pairing_passkey or self._serial_pairing_pin
-            if pin:
-                log(
-                    "RNode BLE entering passkey: " + "{:06d}".format(pin),
-                    LOG_NOTICE,
-                )
-                self._ble.gap_passkey(self._conn_handle, action, pin)
-            else:
-                log(
-                    "RNode BLE passkey required but no pairing_passkey configured. "
-                    "Set pairing_passkey in config or configure serial_port "
-                    "for automatic PIN retrieval.",
-                    LOG_ERROR,
-                )
-        elif action == _PASSKEY_ACTION_NUMERIC_CMP:
-            # Numeric comparison — both devices show the same number.
-            # Auto-confirm since we trust the RNode we specifically scanned for.
-            log("RNode BLE numeric comparison: confirming", LOG_NOTICE)
+            diag_print(
+                "Submitting RNode static PIN: {:06d}".format(self.pairing_passkey)
+            )
+            self._ble.gap_passkey(self._conn_handle, action, self.pairing_passkey)
+        elif action == _PASSKEY_ACTION_NUMERIC_COMPARISON:
             self._ble.gap_passkey(self._conn_handle, action, 1)
-        elif action == _PASSKEY_ACTION_DISPLAY:
-            # We should display a passkey for the RNode to accept.
-            # Log it for debugging.
-            log("RNode BLE display passkey: " + str(passkey), LOG_NOTICE)
-
-    # ==================================================================
-    # GATT Service Discovery
-    # ==================================================================
 
     def _on_service_result(self, data):
-        """Handle _IRQ_GATTC_SERVICE_RESULT."""
-        conn_handle, start_handle, end_handle, uuid = data
-        # We filtered by UUID in discover_services, so any result is
-        # our target service. Store the handle range immediately.
-        self._service_handle = (start_handle, end_handle)
-        log(
-            "RNode BLE found NUS service (handles "
-            + str(start_handle)
-            + "-"
-            + str(end_handle)
-            + ")",
-            LOG_NOTICE,
-        )
+        self._service_handle = (data[1], data[2])
 
     def _on_service_done(self, data):
-        """Handle _IRQ_GATTC_SERVICE_DONE: service enumeration complete."""
-        conn_handle, status = data
         self._discovering = False
-        self._service_discovered = True  # Mark service discovery as done
-        log("RNode BLE service discovery done (status=" + str(status) + ")", LOG_DEBUG)
-
         if self._service_handle is None:
-            log("RNode BLE NUS service not found on device", LOG_ERROR)
+            diag_print("NUS Service not found!")
             self._disconnect()
             return
-
-        # Start characteristic discovery within the NUS service
-        start_handle, end_handle = self._service_handle
-        self._char_discovered = False
-        self._rx_char_handle = None
-        self._tx_char_handle = None
         self._discovering = True
-
         try:
-            # Discover all characteristics in the service range
             self._ble.gattc_discover_characteristics(
-                self._conn_handle,
-                start_handle,
-                end_handle,
+                self._conn_handle, self._service_handle[0], self._service_handle[1]
             )
         except Exception as e:
-            log("RNode BLE char discover failed: " + str(e), LOG_ERROR)
+            diag_print("GATT char discovery failed: " + str(e))
             self._disconnect()
-
-    # ==================================================================
-    # Characteristic Discovery
-    # ==================================================================
 
     def _on_char_result(self, data):
-        """Handle _IRQ_GATTC_CHARACTERISTIC_RESULT."""
-        conn_handle, end_handle, value_handle, properties, uuid = data
-        # Per MicroPython docs: uuid is a memoryview only valid during IRQ.
-        # bt.UUID(uuid) creates a proper UUID object. str(UUID) returns
-        # "UUID('xxxx')" on MicroPython, so we extract the hex string.
         try:
-            uuid_obj = bt.UUID(uuid)
-            # bt.UUID.hex() returns the raw hex without dashes on MicroPython
-            # bt.UUID string format varies — compare using the UUID object directly
+            uuid = bt.UUID(data[4])
         except Exception:
-            uuid_obj = None
-
-        log(
-            "RNode BLE char result: uuid="
-            + str(uuid_obj)
-            + " value_h="
-            + str(value_handle)
-            + " props=0x"
-            + ("%02x" % properties),
-            LOG_NOTICE,
-        )
-
-        # Compare UUID objects directly — MicroPython bt.UUID supports equality
-        tx_uuid = bt.UUID(UART_TX_CHAR_UUID)
-        rx_uuid = bt.UUID(UART_RX_CHAR_UUID)
-
-        if uuid_obj == rx_uuid:
-            self._rx_char_handle = value_handle
-            self._rx_char_props = properties
-            log(
-                "RNode BLE found RX char (handle="
-                + str(value_handle)
-                + ", props=0x"
-                + ("%02x" % properties)
-                + ")",
-                LOG_NOTICE,
-            )
-        elif uuid_obj == tx_uuid:
-            self._tx_char_handle = value_handle
-            self._tx_char_props = properties
-            log(
-                "RNode BLE found TX char (handle="
-                + str(value_handle)
-                + ", props=0x"
-                + ("%02x" % properties)
-                + ")",
-                LOG_NOTICE,
-            )
+            uuid = None
+        if uuid == UART_RX_CHAR_UUID:
+            self._rx_char_handle = data[2]
+        elif uuid == UART_TX_CHAR_UUID:
+            self._tx_char_handle = data[2]
 
     def _on_char_done(self, data):
-        """Handle _IRQ_GATTC_CHARACTERISTIC_DONE: characteristic discovery complete."""
-        conn_handle, status = data
         self._discovering = False
-        log("RNode BLE char discovery done (status=" + str(status) + ")", LOG_DEBUG)
-
-        if self._tx_char_handle is None:
-            log("RNode BLE TX characteristic not found", LOG_ERROR)
+        if not self._tx_char_handle or not self._rx_char_handle:
+            diag_print("NUS characteristics not found!")
             self._disconnect()
             return
-        if self._rx_char_handle is None:
-            log("RNode BLE RX characteristic not found", LOG_ERROR)
-            self._disconnect()
-            return
-
         self._char_discovered = True
-
-        # Discover descriptors to find the CCCD for the TX characteristic.
-        # We need the CCCD handle to subscribe to notifications.
-        self._cccd_handle = None
         self._discovering = True
         try:
-            # Discover descriptors in the TX characteristic's range:
-            # from (tx_value_handle + 1) to the end of the service or
-            # next characteristic. We'll use the end_handle of the service
-            # as the upper bound.
-            start_desc = self._tx_char_handle + 1
-            # Use the service end handle, but cap it at the next char - 1
-            # Since we don't know the next char, use the service end handle
-            end_desc = self._service_handle[1] if self._service_handle else 0xFFFF
-            if start_desc <= end_desc:
-                log(
-                    "RNode BLE discovering descriptors ("
-                    + str(start_desc)
-                    + "-"
-                    + str(end_desc)
-                    + ")",
-                    LOG_DEBUG,
-                )
-                self._ble.gattc_discover_descriptors(
-                    self._conn_handle, start_desc, end_desc
-                )
-            else:
-                # No room for descriptors, assume CCCD = tx_handle + 1
-                self._cccd_handle = self._tx_char_handle + 1
-                self._discovering = False
-                log(
-                    "RNode BLE no descriptor range, assuming CCCD="
-                    + str(self._cccd_handle),
-                    LOG_DEBUG,
-                )
+            self._ble.gattc_discover_descriptors(
+                self._conn_handle,
+                self._tx_char_handle + 1,
+                self._service_handle[1] if self._service_handle else 0xFFFF,
+            )
         except Exception as e:
-            log("RNode BLE descriptor discover failed: " + str(e), LOG_ERROR)
+            diag_print("GATT descriptor discovery failed: " + str(e))
             self._disconnect()
 
     def _on_descriptor_result(self, data):
-        """Handle _IRQ_GATTC_DESCRIPTOR_RESULT: found a descriptor."""
-        conn_handle, dsc_handle, uuid = data
         try:
-            uuid_obj = bt.UUID(uuid)
+            uuid = bt.UUID(data[2])
         except Exception:
-            uuid_obj = None
-
-        # CCCD UUID is 0x2902
-        if uuid_obj == bt.UUID(0x2902):
-            self._cccd_handle = dsc_handle
-            log(
-                "RNode BLE found CCCD descriptor (handle=" + str(dsc_handle) + ")",
-                LOG_NOTICE,
-            )
-        else:
-            log(
-                "RNode BLE descriptor: handle="
-                + str(dsc_handle)
-                + " uuid="
-                + str(uuid_obj),
-                LOG_DEBUG,
-            )
+            uuid = None
+        if uuid == bt.UUID(0x2902):
+            self._cccd_handle = data[1]
 
     def _on_descriptor_done(self, data):
-        """Handle _IRQ_GATTC_DESCRIPTOR_DONE: descriptor discovery complete."""
-        conn_handle, status = data
         self._discovering = False
         self._desc_discovered = True
-
         if self._cccd_handle is None:
-            # Fallback: assume CCCD is at tx_char_handle + 1
             self._cccd_handle = self._tx_char_handle + 1
-            log(
-                "RNode BLE CCCD not found, assuming handle=" + str(self._cccd_handle),
-                LOG_NOTICE,
-            )
-        log("RNode BLE descriptor discovery done", LOG_DEBUG)
-
-        # _subscribing will be set True when poll_loop calls
-
-    # ==================================================================
-    # Notification Subscription
-    # ==================================================================
 
     def _subscribe_notifications(self):
-        """Write the CCCD to enable notifications on the TX characteristic.
-
-        Uses write-with-response (mode=1) for the CCCD write to ensure
-        the RNode's BLE stack has processed the subscription before we
-        send detection bytes. The RNode bridge C++ code triggers
-        CMD_READY in its BLE_GAP_EVENT_SUBSCRIBE handler, so we need the
-        write to complete before sending data.
-
-        If the CCCD write fails (e.g. insufficient encryption), we
-        attempt gap_pair() and retry.
-        """
-        if not self._ble or self._conn_handle is None or self._tx_char_handle is None:
+        if self._conn_handle is None or self._cccd_handle is None:
             return
-        if self._cccd_handle is None:
-            log("RNode BLE no CCCD handle available", LOG_ERROR)
-            self._disconnect()
-            return
-
         try:
-            self._ble.gattc_write(
-                self._conn_handle,
-                self._cccd_handle,
-                b"\x01\x00",  # Enable notifications (little-endian)
-                1,  # mode=1: write-with-response — ensures RNode processes CCCD before we send data
-            )
-            self._subscribing = True  # Wait for _on_write_done before proceeding
-            log(
-                "RNode BLE CCCD write sent (handle="
-                + str(self._cccd_handle)
-                + "), waiting for response",
-                LOG_NOTICE,
-            )
-        except Exception as e:
-            log("RNode BLE CCCD write failed: " + str(e), LOG_ERROR)
-            # If encryption error, try pairing first then retry
-            if not self._pairing_attempted and not self._encrypted:
-                log("RNode BLE attempting pairing before CCCD retry", LOG_NOTICE)
-                self._pairing_attempted = True
-                try:
-                    self._ble.gap_pair(self._conn_handle)
-                except Exception as pe:
-                    log("RNode BLE pair failed: " + str(pe), LOG_WARNING)
-                # Don't disconnect — poll_loop will retry subscribe after encryption
-            else:
-                self._subscribing = False
-                self._disconnect()
+            self._ble.gattc_write(self._conn_handle, self._cccd_handle, b"\x01\x00", 1)
+            self._subscribing, self._subscribe_start_time = True, time.time()
+        except Exception:
+            self._disconnect()
 
     def _on_write_done(self, data):
-        """Handle _IRQ_GATTC_WRITE_DONE.
-
-        Triggered by write-with-response (mode=1) calls. For CCCD writes,
-        a successful response means the RNode has processed the subscription
-        and will begin sending notifications (including CMD_READY).
-        """
-        conn_handle, value_handle, status = data
-
-        if conn_handle != self._conn_handle:
+        if data[0] != self._conn_handle:
             return
-
-        if value_handle == self._cccd_handle and self._subscribing:
-            # CCCD write response — now we know the RNode has processed our
-            # subscription request
-            if status == 0:
-                log("RNode BLE subscribed to TX notifications", LOG_NOTICE)
+        if data[1] == self._cccd_handle and self._subscribing:
+            self._subscribing = False
+            if data[2] == 0:
+                diag_print("Subscribed!")
                 self._notify_enabled = True
-                self._subscribing = False
-                # Send the detection handshake now that notifications are enabled
-                self._send_detection()
-                self._detect_sent_time = time.time()
             else:
-                log(
-                    "RNode BLE CCCD write failed: status=" + str(status),
-                    LOG_WARNING,
-                )
-                # Status 261 (0x105) = insufficient encryption — try pairing
-                if not self._pairing_attempted and not self._encrypted:
-                    log("RNode BLE pairing and retrying CCCD", LOG_NOTICE)
-                    self._pairing_attempted = True
-                    try:
-                        self._ble.gap_pair(self._conn_handle)
-                    except Exception as pe:
-                        log("RNode BLE pair failed: " + str(pe), LOG_WARNING)
-                    # _subscribing stays True — we'll retry after encryption
-                    # or timeout in poll_loop
-                else:
-                    self._subscribing = False
-                    self._disconnect()
-        elif status != 0:
-            log(
-                "RNode BLE write failed: handle="
-                + str(value_handle)
-                + " status="
-                + str(status),
-                LOG_WARNING,
-            )
-
-    # ==================================================================
-    # KISS Protocol — Detection Handshake
-    # ==================================================================
+                self._disconnect()
 
     def _send_detection(self):
-        """Send the RNode detection command sequence.
-
-        After connecting and enabling notifications, we send:
-          [FEND][CMD_DETECT][DETECT_REQ][FEND]
-          [FEND][CMD_FW_VERSION][0x00][FEND]
-          [FEND][CMD_PLATFORM][0x00][FEND]
-          [FEND][CMD_MCU][0x00][FEND]
-
-        Then we wait for response frames to confirm detection.
-        """
-        log("RNode BLE sending detection handshake", LOG_NOTICE)
         self._detect_retries += 1
-
-        # Build detection command sequence
-        detect_frame = bytes(
-            [
-                FEND,
-                CMD_DETECT,
-                DETECT_REQ,
-                FEND,
-                CMD_FW_VERSION,
-                0x00,
-                FEND,
-                CMD_PLATFORM,
-                0x00,
-                FEND,
-                CMD_MCU,
-                0x00,
-                FEND,
-            ]
+        self._ble_write_raw(
+            bytes(
+                [
+                    FEND,
+                    CMD_DETECT,
+                    DETECT_REQ,
+                    FEND,
+                    CMD_FW_VERSION,
+                    0,
+                    FEND,
+                    CMD_PLATFORM,
+                    0,
+                    FEND,
+                    CMD_MCU,
+                    0,
+                    FEND,
+                ]
+            )
         )
-        self._ble_write_raw(detect_frame)
 
     def _send_radio_config(self):
-        """Send radio configuration commands to the RNode.
-
-        Sends frequency, bandwidth, TX power, spreading factor, and coding rate.
-        Then sets radio state to ON.
-        """
-        log("RNode BLE sending radio configuration", LOG_DEBUG)
-
-        # Frequency: 4 bytes big-endian
-        freq_bytes = struct.pack(">I", self.frequency)
-        # Bandwidth: 4 bytes big-endian
-        bw_bytes = struct.pack(">I", self.bandwidth)
-
-        config_frame = bytearray()
-        # CMD_FREQUENCY
-        config_frame.extend(bytes([FEND, CMD_FREQUENCY]))
-        config_frame.extend(_kiss_escape(freq_bytes))
-        config_frame.append(FEND)
-        # CMD_BANDWIDTH
-        config_frame.extend(bytes([FEND, CMD_BANDWIDTH]))
-        config_frame.extend(_kiss_escape(bw_bytes))
-        config_frame.append(FEND)
-        # CMD_TXPOWER
-        config_frame.extend(bytes([FEND, CMD_TXPOWER]))
-        config_frame.extend(_kiss_escape(bytes([self.txpower])))
-        config_frame.append(FEND)
-        # CMD_SF
-        config_frame.extend(bytes([FEND, CMD_SF]))
-        config_frame.extend(_kiss_escape(bytes([self.spreadingfactor])))
-        config_frame.append(FEND)
-        # CMD_CR
-        config_frame.extend(bytes([FEND, CMD_CR]))
-        config_frame.extend(_kiss_escape(bytes([self.codingrate])))
-        config_frame.append(FEND)
-        # CMD_RADIO_STATE = ON
-        config_frame.extend(bytes([FEND, CMD_RADIO_STATE, RADIO_STATE_ON, FEND]))
-
-        self._ble_write_raw(bytes(config_frame))
-
-    # ==================================================================
-    # KISS Protocol — Incoming Data Processing
-    # ==================================================================
+        freq, bw = struct.pack(">I", self.frequency), struct.pack(">I", self.bandwidth)
+        cfg = bytearray()
+        cfg.extend(bytes([FEND, CMD_FREQUENCY]) + _kiss_escape(freq) + bytes([FEND]))
+        cfg.extend(bytes([FEND, CMD_BANDWIDTH]) + _kiss_escape(bw) + bytes([FEND]))
+        cfg.extend(
+            bytes([FEND, CMD_TXPOWER])
+            + _kiss_escape(bytes([self.txpower]))
+            + bytes([FEND])
+        )
+        cfg.extend(
+            bytes([FEND, CMD_SF])
+            + _kiss_escape(bytes([self.spreadingfactor]))
+            + bytes([FEND])
+        )
+        cfg.extend(
+            bytes([FEND, CMD_CR])
+            + _kiss_escape(bytes([self.codingrate]))
+            + bytes([FEND])
+        )
+        cfg.extend(bytes([FEND, CMD_RADIO_STATE, RADIO_STATE_ON, FEND]))
+        self._ble_write_raw(bytes(cfg))
 
     def _on_notify(self, data):
-        """Handle _IRQ_GATTC_NOTIFY: data received from the RNode's TX char."""
-        conn_handle, value_handle, notify_data = data
-
-        if value_handle != self._tx_char_handle:
-            return
-
-        if not notify_data:
-            return
-
-        # Copy memoryview to bytes – data only valid during IRQ handler
-        raw_bytes = bytes(notify_data)
-        log("RNode BLE notify: " + str(len(raw_bytes)) + " bytes", LOG_NOTICE)
-        self._kiss_feed(raw_bytes)
+        if data[1] == self._tx_char_handle and data[2]:
+            self._kiss_feed(bytes(data[2]))
 
     def _kiss_feed(self, data):
-        """Process incoming BLE bytes through the KISS decoder.
-
-        KISS framing:
-          FEND command data_bytes... FEND
-
-        Escape sequences inside frames:
-          FESC TFESC → 0xDB
-          FESC TFEND → 0xC0
-
-        When we receive a complete frame, we dispatch it via
-        _kiss_dispatch().
-        """
         for b in data:
             if b == FEND:
-                # End of frame — dispatch if we have data
                 if self._in_frame and len(self._kiss_buf) > 0:
                     self._kiss_dispatch(self._current_cmd, bytes(self._kiss_buf))
-                # Reset frame state
-                self._in_frame = False
-                self._escaping = False
+                self._in_frame = self._escaping = False
                 self._kiss_buf = bytearray()
                 self._current_cmd = None
                 continue
-
             if not self._in_frame:
-                # Start of frame — first byte after FEND is the command
-                self._in_frame = True
-                self._current_cmd = b
-                self._kiss_buf = bytearray()
-                self._escaping = False
+                self._in_frame, self._current_cmd, self._kiss_buf, self._escaping = (
+                    True,
+                    b,
+                    bytearray(),
+                    False,
+                )
                 continue
-
-            # Inside frame
             if b == FESC:
                 self._escaping = True
                 continue
-
             if self._escaping:
-                if b == TFEND:
-                    self._kiss_buf.append(0xC0)
-                elif b == TFESC:
-                    self._kiss_buf.append(0xDB)
-                else:
-                    # Invalid escape — skip (protocol error, keep going)
-                    self._kiss_buf.append(b)
+                self._kiss_buf.append(0xC0 if b == TFEND else 0xDB if b == TFESC else b)
                 self._escaping = False
                 continue
-
             self._kiss_buf.append(b)
 
     def _kiss_dispatch(self, cmd, data):
-        """Dispatch a complete KISS frame based on its command byte.
-
-        CMD_DATA: RNS packet data → process_incoming()
-        CMD_DETECT: Detection response
-        CMD_READY: Radio is ready
-        CMD_STAT_RSSI/SNR/BAT: Status reports
-        CMD_PLATFORM/MCU/FW_VERSION: Device info responses
-        CMD_FREQUENCY/BANDWIDTH/TXPOWER/SF/CR: Config acknowledgements
-        CMD_RADIO_STATE: Radio state response
-        """
-        if cmd == CMD_DATA:
-            # RNS packet data
-            if data and len(data) > 0:
-                self.process_incoming(data)
-
-        elif cmd == CMD_DETECT:
-            # Detection response from RNode
-            if len(data) > 0 and data[0] == DETECT_ACK:
-                self._detected = True
-                self._detect_retries = 0
-                log("RNode BLE detected (RNode acknowledged)", LOG_NOTICE)
-                # Now configure the radio
-                self._send_radio_config()
-            else:
-                log(
-                    "RNode BLE detection unexpected response: " + str(list(data)),
-                    LOG_WARNING,
-                )
-
-        elif cmd == CMD_READY:
-            # Radio is ready — we are now fully online
-            self._radio_configured = True
-            self.online = True
-            self._reconnect_count = 0
-            self._serial_pairing_attempts = 0
-            self._serial_pairing_pin = None
-            log("RNode BLE interface ONLINE (radio ready)", LOG_NOTICE)
-
-        elif cmd == CMD_RADIO_STATE:
-            if len(data) > 0:
-                state = data[0]
-                if state == RADIO_STATE_ON:
-                    self._radio_configured = True
-                    self.online = True
-                    self._reconnect_count = 0
-                    self._serial_pairing_attempts = 0
-                    self._serial_pairing_pin = None
-                    log("RNode BLE radio state ON", LOG_NOTICE)
-                elif state == RADIO_STATE_OFF:
-                    log("RNode BLE radio state OFF", LOG_WARNING)
-
-        elif cmd == CMD_STAT_RSSI:
-            if len(data) >= 2:
-                # RSSI is sent as 2-byte signed big-endian
-                self.rssi = struct.unpack(">h", data[0:2])[0]
-                log("RNode BLE RSSI: " + str(self.rssi), LOG_DEBUG)
-
-        elif cmd == CMD_STAT_SNR:
-            if len(data) >= 1:
-                # SNR is a single signed byte (dB × 4 in some implementations)
-                self.snr = struct.unpack(">b", data[0:1])[0]
-                log("RNode BLE SNR: " + str(self.snr), LOG_DEBUG)
-
-        elif cmd == CMD_STAT_BAT:
-            if len(data) >= 2:
-                # Battery level as 2-byte value (percentage or mV)
-                self.battery_level = struct.unpack(">H", data[0:2])[0]
-                log("RNode BLE battery: " + str(self.battery_level), LOG_DEBUG)
-
-        elif cmd == CMD_PLATFORM:
-            if len(data) > 0:
-                try:
-                    self.rnode_platform = (
-                        data.decode("utf-8") if isinstance(data, bytes) else str(data)
-                    )
-                except Exception:
-                    self.rnode_platform = str(list(data))
-                log("RNode BLE platform: " + str(self.rnode_platform), LOG_DEBUG)
-
-        elif cmd == CMD_MCU:
-            if len(data) > 0:
-                try:
-                    self.rnode_mcu = (
-                        data.decode("utf-8") if isinstance(data, bytes) else str(data)
-                    )
-                except Exception:
-                    self.rnode_mcu = str(list(data))
-                log("RNode BLE MCU: " + str(self.rnode_mcu), LOG_DEBUG)
-
-        elif cmd == CMD_FW_VERSION:
-            if len(data) >= 2:
-                major = data[0]
-                minor = data[1]
-                self.rnode_fw_version = str(major) + "." + str(minor)
-                log("RNode BLE firmware: " + self.rnode_fw_version, LOG_DEBUG)
-
-        elif cmd == CMD_FREQUENCY:
-            log("RNode BLE frequency confirmed", LOG_DEBUG)
-
-        elif cmd == CMD_BANDWIDTH:
-            log("RNode BLE bandwidth confirmed", LOG_DEBUG)
-
-        elif cmd == CMD_TXPOWER:
-            log("RNode BLE TX power confirmed", LOG_DEBUG)
-
-        elif cmd == CMD_SF:
-            log("RNode BLE spreading factor confirmed", LOG_DEBUG)
-
-        elif cmd == CMD_CR:
-            log("RNode BLE coding rate confirmed", LOG_DEBUG)
-
-        else:
-            # Unknown KISS command — log but don't crash
-            log("RNode BLE unknown KISS cmd: 0x" + ("%02x" % cmd), LOG_DEBUG)
-
-    # ==================================================================
-    # Outgoing Data — KISS Framing
-    # ==================================================================
+        if cmd == CMD_DATA and data:
+            self.process_incoming(data)
+        elif cmd == CMD_DETECT and data and data[0] == DETECT_ACK:
+            self._detected = True
+            diag_print("RNode Handshake ACK!")
+            self._send_radio_config()
+        elif cmd == CMD_READY or (
+            cmd == CMD_RADIO_STATE and data and data[0] == RADIO_STATE_ON
+        ):
+            self._radio_configured = self.online = True
+            diag_print("Interface is ONLINE!")
+        elif cmd == CMD_FW_VERSION and len(data) >= 2:
+            diag_print("RNode FW Version {}.{}".format(data[0], data[1]))
 
     def process_outgoing(self, data):
-        """Send an RNS packet out through the RNode BLE interface.
-
-        Applies IFAC signing, then KISS-frames the packet and queues it
-        for transmission in the poll loop.
-        """
         if not self.online or self._conn_handle is None or self._rx_char_handle is None:
-            log(
-                "RNode BLE TX: not connected, dropping " + str(len(data)) + "B",
-                LOG_DEBUG,
-            )
             return False
-
         try:
-            data = self.ifac_sign(data)
-
-            # KISS-frame the data: FEND + CMD_DATA + escaped_data + FEND
-            escaped = _kiss_escape(data)
-            frame = bytes([FEND, CMD_DATA]) + escaped + bytes([FEND])
-
-            self._write_queue.append(frame)
-            self.txb += len(data)
-            self.tx += 1
-            self._last_activity = time.time()
+            self._write_queue.append(
+                bytes([FEND, CMD_DATA]) + _kiss_escape(data) + bytes([FEND])
+            )
+            self.txb, self.tx, self._last_activity = (
+                self.txb + len(data),
+                self.tx + 1,
+                time.time(),
+            )
             return True
-        except Exception as e:
-            log("RNode BLE TX error: " + str(e), LOG_ERROR)
+        except Exception:
             return False
-
-    @property
-    def _effective_mtu(self):
-        """Effective write payload size = negotiated MTU - 3 bytes ATT overhead."""
-        return max(20, self._negotiated_mtu - 3)
 
     def _ble_write_raw(self, data):
-        """Write raw bytes to the BLE RX characteristic (no KISS framing).
-
-        Used for detection handshake and radio config commands that are
-        already KISS-framed.
-        """
         if self._conn_handle is None or self._rx_char_handle is None:
-            log("RNode BLE raw write: not connected", LOG_WARNING)
             return
-        log(
-            "RNode BLE raw write: "
-            + str(len(data))
-            + " bytes to RX handle "
-            + str(self._rx_char_handle),
-            LOG_NOTICE,
-        )
-        # Send in chunks that fit within the effective BLE MTU
-        mtu = self._effective_mtu
-        offset = 0
+        mtu, offset = max(20, self._negotiated_mtu - 3), 0
         while offset < len(data):
             chunk = data[offset : offset + mtu]
             try:
-                self._ble.gattc_write(
-                    self._conn_handle,
-                    self._rx_char_handle,
-                    chunk,
-                    0,  # mode=0: write-without-response (no confirmation)
-                )
-            except Exception as e:
-                log("RNode BLE raw write error: " + str(e), LOG_ERROR)
+                self._ble.gattc_write(self._conn_handle, self._rx_char_handle, chunk, 0)
+            except Exception:
                 return
             offset += len(chunk)
 
     def _ble_write_kiss(self, frame):
-        """Write a KISS-framed packet to the BLE RX characteristic.
-
-        Splits the frame into MTU-sized chunks for BLE transmission.
-        """
-        if self._conn_handle is None or self._rx_char_handle is None:
-            return
-
-        mtu = self._effective_mtu
-        offset = 0
-        while offset < len(frame):
-            chunk = frame[offset : offset + mtu]
-            try:
-                self._ble.gattc_write(
-                    self._conn_handle,
-                    self._rx_char_handle,
-                    chunk,
-                    0,  # mode=0: write-without-response (no confirmation)
-                )
-            except Exception as e:
-                log("RNode BLE KISS write error: " + str(e), LOG_ERROR)
-                return
-            offset += len(chunk)
-
-    # ==================================================================
-    # BLE Disconnect / Reconnect
-    # ==================================================================
+        self._ble_write_raw(frame)
 
     def _disconnect(self):
-        """Disconnect from the RNode."""
         if self._conn_handle is not None and self._ble:
             try:
                 self._ble.gap_disconnect(self._conn_handle)
-            except:
+            except Exception:
                 pass
 
-    def _reconnect(self):
-        """Initiate reconnection to the RNode."""
-        self.online = False
-        self._detected = False
-        self._radio_configured = False
-        self._kiss_buf = bytearray()
-        self._in_frame = False
-        self._escaping = False
-        self._write_queue = []
-
-        self._reconnect_count += 1
-        self._last_reconnect = time.time()
-        log(
-            "RNode BLE reconnecting (attempt " + str(self._reconnect_count) + ")",
-            LOG_DEBUG,
-        )
-        self._start_scan()
-
-    # ==================================================================
-    # Async Poll Loop
-    # ==================================================================
-
-    async def poll_loop(self):
-        """Async event loop that manages the BLE connection lifecycle.
-
-        Handles:
-          - Scanning for the target RNode device
-          - Connecting and discovering services
-          - Detection handshake and radio configuration
-          - Reconnection on disconnection
-          - Processing the outgoing write queue
-          - Periodic garbage collection
-        """
+    async def _proactive_pin_injection(self):
         import uasyncio as asyncio
 
-        log("RNode BLE poll loop started for " + self.name, LOG_VERBOSE)
+        # Wait 1.5 seconds for GATT / SMP exchange to transition to Passkey Entry state over-the-air
+        await asyncio.sleep(1.5)
+        if self._conn_handle is not None and not self._encrypted:
+            diag_print(
+                "Proactively injecting RNode static PIN {:06d} (Bypassing Central IRQ bug)...".format(
+                    self.pairing_passkey
+                )
+            )
+            try:
+                # 2 = _PASSKEY_ACTION_INPUT
+                self._ble.gap_passkey(self._conn_handle, 2, self.pairing_passkey)
+            except Exception as e:
+                diag_print("Proactive PIN injection failed: " + str(e))
 
+    async def poll_loop(self):
+        import uasyncio as asyncio
+
+        diag_print("Active poll loop started.")
         _last_gc = time.time()
-        _scan_start = 0
-        _write_yield_counter = 0
+        _write_yield = 0
 
         while self.enabled and not self._shutting_down:
             try:
                 now = time.time()
-
-                # Periodic GC
                 if now - _last_gc >= 10:
                     gc.collect()
                     _last_gc = now
 
-                # ----- State: Not connected, not scanning -----
-                if (
-                    self._conn_handle is None
-                    and not self._scanning
-                    and not self._connecting
-                ):
-                    # Wait for reconnect delay
-                    if (
-                        self._last_reconnect > 0
-                        and (now - self._last_reconnect) < self.reconnect_delay
-                    ):
+                if self._secrets_dirty:
+                    self._secrets_dirty = False
+                    self._save_secrets()
+
+                # Safely write bonding status to flash in main thread (Not in IRQ context)
+                if self._bonded_dirty:
+                    self._bonded_dirty = False
+                    try:
+                        with open("bonded.txt", "w") as f:
+                            f.write("1")
+                        diag_print("Bonding status saved to bonded.txt")
+                    except Exception as e:
+                        diag_print("Failed to save bonding status: " + str(e))
+
+                # --- 1. Connection Negotiation State ---
+                if self._conn_handle is None:
+                    if not self._scanning and not self._connecting:
+                        if (
+                            self._last_reconnect > 0
+                            and (now - self._last_reconnect) < self.reconnect_delay
+                        ):
+                            await asyncio.sleep(0.1)
+                            continue
+                        if self._target_addr_found is not None:
+                            addr_type, addr = self._target_addr_found
+                            diag_print("Connecting to matched RNode...")
+                            try:
+                                self._connecting = True
+                                self._ble.gap_connect(addr_type, addr)
+                            except Exception as e:
+                                diag_print("Connect failed: " + str(e))
+                                self._connecting = False
+                                self._last_reconnect = now
+                            continue
+                        self._start_scan()
+                        continue
+
+                    if self._scanning:
+                        if (
+                            self._scan_result is False
+                            or (now - self._scan_start_time) >= self.scan_timeout
+                        ):
+                            self._stop_scan()
+                            if self._target_addr_found is None:
+                                self._last_reconnect = now
+                            continue
                         await asyncio.sleep(0.1)
                         continue
 
-                    # Start scanning
-                    self._start_scan()
-                    _scan_start = now
-                    continue
-
-                # ----- State: Scanning -----
-                if self._scanning:
-                    # Check for timeout
-                    if (
-                        self._scan_result is False
-                        or (now - _scan_start) >= self.scan_timeout
-                    ):
-                        self._stop_scan()
-                        if self._target_addr_found is None:
-                            log(
-                                "RNode BLE scan: target not found, retrying",
-                                LOG_DEBUG,
-                            )
-                            self._last_reconnect = now
+                    if self._connecting:
+                        await asyncio.sleep(0.1)
                         continue
 
-                    # Check if we found a target
-                    if self._target_addr_found is not None:
-                        addr_type, addr_bytes = self._target_addr_found
-                        self._stop_scan()
-                        log(
-                            "RNode BLE connecting to "
-                            + ":".join(("%02x" % b) for b in addr_bytes),
-                            LOG_VERBOSE,
-                        )
-                        try:
-                            self._ble.gap_connect(addr_type, addr_bytes)
-                            self._connecting = True
-                        except Exception as e:
-                            log("RNode BLE connect failed: " + str(e), LOG_ERROR)
-                            self._last_reconnect = now
+                # --- 2. Stabilized Connection State (Active Handle) ---
 
-                    await asyncio.sleep(0.01)
-                    continue
-
-                # ----- State: Connecting / Subscribing -----
-                if self._connecting or self._subscribing:
-                    await asyncio.sleep(0.01)
-                    continue
-
-                # ----- State: Connected, wait for encryption (if pairing was triggered) -----
-                # We only wait for encryption if we explicitly called gap_pair()
-                # after a CCCD write failure. The RNode uses Just Works (no MITM)
-                # so encryption may happen automatically without our init.
-                if (
-                    self._conn_handle is not None
-                    and not self._encrypted
-                    and self._pairing_attempted
-                    and not self._mtu_exchanged
-                ):
-                    # Wait for encryption to complete after pairing attempt
-                    await asyncio.sleep(0.01)
-                    continue
-
-                # ----- State: Connected, exchange MTU before service discovery -----
-                # Skip encryption wait if we haven't attempted pairing — the
-                # RNode uses Just Works and doesn't require encryption for CCCD.
-                if (
-                    self._conn_handle is not None
-                    and not self._mtu_exchanged
-                    and not self._discovering
-                    and (self._encrypted or not self._pairing_attempted)
-                ):
+                # Step A: Perform MTU Exchange first
+                if not self._mtu_exchanged:
                     try:
+                        diag_print("Initiating MTU Exchange...")
                         self._ble.gattc_exchange_mtu(self._conn_handle)
-                        log("RNode BLE requesting MTU exchange", LOG_DEBUG)
-                    except OSError as e:
-                        # EALREADY (errno 120) means MTU was already exchanged
-                        # by the BLE stack automatically during connection.
-                        # Treat this as success.
-                        if getattr(e, "errno", None) == 120 or "EALREADY" in str(e):
-                            log("RNode BLE MTU already exchanged (EALREADY)", LOG_DEBUG)
-                            self._mtu_exchanged = True
-                            self._negotiated_mtu = self._ble.config("mtu")
+                    except Exception as e:
+                        diag_print("MTU Exchange failed: " + str(e))
+                    for _ in range(30):  # 3s timeout
+                        if self._mtu_exchanged or self._conn_handle is None:
+                            break
+                        await asyncio.sleep(0.1)
+                    if self._conn_handle is None:
+                        continue
+                    if not self._mtu_exchanged:
+                        diag_print("MTU exchange timed out, proceeding.")
+                        self._mtu_exchanged = True  # fallback
+
+                # Step B: Perform Encryption / Pairing immediately after MTU Exchange
+                if not self._encrypted:
+                    if not self._pairing_attempted:
+                        self._pairing_attempted = True
+                        self._pairing_start_time = time.time()
+
+                        if self._pending_pair:
+                            diag_print(
+                                "Initiating LE Legacy Pairing for PIN {:06d}...".format(
+                                    self.pairing_passkey
+                                )
+                            )
+                            try:
+                                self._ble.gap_pair(self._conn_handle)
+                                # Workaround for MicroPython Central IRQ bug:
+                                # Proactively inject the PIN after a short delay so NimBLE can authenticate.
+                                asyncio.create_task(self._proactive_pin_injection())
+                            except Exception as e:
+                                diag_print(
+                                    "gap_pair() fresh pairing trigger failed: " + str(e)
+                                )
+                                self._disconnect()
+                                continue
                         else:
-                            log("RNode BLE MTU exchange error: " + str(e), LOG_ERROR)
-                    except Exception as e:
-                        log("RNode BLE MTU exchange failed: " + str(e), LOG_ERROR)
-                    await asyncio.sleep(0.05)
-                    continue
+                            diag_print(
+                                "Bond found. Initiating encryption using stored keys..."
+                            )
+                            try:
+                                self._ble.gap_pair(self._conn_handle)
+                            except Exception as e:
+                                diag_print(
+                                    "gap_pair() reconnect trigger failed: " + str(e)
+                                )
+                                self._disconnect()
+                                continue
 
-                # ----- State: Connected, start GATT discovery (after MTU exchange) -----
-                if (
-                    self._conn_handle is not None
-                    and self._mtu_exchanged
-                    and not self._service_discovered
-                    and not self._discovering
-                ):
-                    # MTU exchanged, safe to start service discovery
-                    self._discovering = True
-                    try:
-                        self._ble.gattc_discover_services(
-                            self._conn_handle, bt.UUID(UART_SERVICE_UUID)
-                        )
-                        log("RNode BLE starting service discovery", LOG_DEBUG)
-                    except Exception as e:
-                        log("RNode BLE service discover failed: " + str(e), LOG_ERROR)
+                    # Wait for encryption status update
+                    paired_ok = False
+                    # Allow up to 25s for the first-time pairing (giving room for pin entry)
+                    # and up to 10s for subsequent automatic key reconnection.
+                    timeout_val = 25 if self._pending_pair else 10
+                    while (time.time() - self._pairing_start_time) < timeout_val:
+                        if self._encrypted or self._conn_handle is None:
+                            paired_ok = self._encrypted
+                            break
+                        await asyncio.sleep(0.1)
+
+                    if self._conn_handle is None:
+                        continue
+
+                    if not paired_ok:
+                        if not self._pending_pair:
+                            diag_print(
+                                "Encryption failed with stored keys. Bond may have been lost on RNode. Triggering fresh pairing..."
+                            )
+                            self._pending_pair = True
+                            self._pairing_attempted = False
+                            try:
+                                import os
+
+                                os.remove("bonded.txt")
+                            except Exception:
+                                pass
+                            self._already_bonded = False
+                            continue
+                        else:
+                            diag_print(
+                                "First-time pairing sequence failed or timed out. Halting interface to prevent endless retries."
+                            )
+                            self.enabled = False
+                            self._disconnect()
+                            continue
+
+                # Step C: Perform GATT Discovery over the secured, encrypted link
+                if not self._desc_discovered:
+                    if not self._discovering:
+                        diag_print("Discovering NUS Service over secure link...")
+                        self._discovering = True
+                        try:
+                            self._ble.gattc_discover_services(
+                                self._conn_handle, UART_SERVICE_UUID
+                            )
+                        except Exception as e:
+                            diag_print("NUS Service discovery failed: " + str(e))
+                            self._disconnect()
+                            continue
+                    for _ in range(100):  # 10s timeout
+                        if self._desc_discovered or self._conn_handle is None:
+                            break
+                        await asyncio.sleep(0.1)
+                    if self._conn_handle is None:
+                        continue
+                    if not self._desc_discovered:
+                        diag_print("GATT service/descriptor discovery timed out!")
                         self._disconnect()
-                    await asyncio.sleep(0.05)
-                    continue
+                        continue
 
-                # ----- State: Discovering services/characteristics -----
-                if self._discovering:
-                    await asyncio.sleep(0.01)
-                    continue
+                # Step D: Subscribe to characteristics once link is secured and discovered
+                if not self._notify_enabled:
+                    if not self._subscribing:
+                        diag_print("Subscribing to TX Characteristic...")
+                        self._subscribe_notifications()
+                    for _ in range(50):  # 5s timeout
+                        if self._notify_enabled or self._conn_handle is None:
+                            break
+                        await asyncio.sleep(0.1)
+                    if self._conn_handle is None:
+                        continue
+                    if not self._notify_enabled:
+                        diag_print("Subscription to RNode characteristic failed!")
+                        self._disconnect()
+                        continue
 
-                # ----- State: Characteristics and descriptors discovered, subscribe -----
-                if (
-                    self._conn_handle is not None
-                    and self._desc_discovered
-                    and not self._notify_enabled
-                    and not self._subscribing
-                ):
-                    self._subscribe_notifications()
+                # Step E: Perform RNode Handshake / Detection
+                if not self._detected:
+                    if (
+                        self._detect_sent_time == 0
+                        or (now - self._detect_sent_time) > 4
+                    ):
+                        if self._detect_retries < 4:
+                            diag_print(
+                                "Sending RNode probe (attempt {})...".format(
+                                    self._detect_retries + 1
+                                )
+                            )
+                            self._send_detection()
+                            self._detect_sent_time = time.time()
+                        else:
+                            diag_print("RNode handshake failed.")
+                            self._disconnect()
+                            continue
                     await asyncio.sleep(0.1)
                     continue
 
-                # ----- State: Subscribing — waiting for CCCD write-done or pairing -----
-                if self._subscribing:
-                    # If we're waiting for CCCD write response, check for timeout
-                    if self._pairing_attempted and not self._encrypted:
-                        # Still waiting for encryption after pairing
-                        await asyncio.sleep(0.01)
-                        continue
-                    elif self._pairing_attempted and self._encrypted:
-                        # Encryption established after failed CCCD — retry CCCD
-                        log(
-                            "RNode BLE encryption established, retrying CCCD",
-                            LOG_NOTICE,
-                        )
-                        self._subscribing = False
-                        # Fall through to subscribe check on next iteration
-                        continue
-                    # Timeout: if we've been subscribing for too long, bail
-                    await asyncio.sleep(0.01)
-                    continue
-
-                # ----- State: Connected but not yet detected/configured -----
-                if self._conn_handle is not None and not self._detected:
-                    # Detection timeout — retry or reconnect
-                    if (
-                        self._detect_sent_time > 0
-                        and (now - self._detect_sent_time) > 5
-                    ):
-                        if self._detect_retries < self._max_detect_retries:
-                            log("RNode BLE detection timeout, retrying", LOG_WARNING)
-                            self._send_detection()
-                            self._detect_sent_time = now
-                        else:
-                            log(
-                                "RNode BLE detection failed after max retries",
-                                LOG_ERROR,
-                            )
-                            self._disconnect()
-                            self._last_reconnect = now
-                    await asyncio.sleep(0.05)
-                    continue
-
-                # ----- State: Connected and online -----
+                # Step F: Transmission Loop
                 if self.online:
-                    # Process outgoing write queue
                     if self._write_queue:
-                        frame = self._write_queue.pop(0)
-                        self._ble_write_kiss(frame)
-                        _write_yield_counter += 1
-                        # Yield to event loop periodically to avoid blocking
-                        if _write_yield_counter >= 5:
-                            _write_yield_counter = 0
+                        self._ble_write_kiss(self._write_queue.pop(0))
+                        _write_yield += 1
+                        if _write_yield >= 5:
+                            _write_yield = 0
                             await asyncio.sleep(0)
-
-                    await asyncio.sleep(0.01)
+                    else:
+                        await asyncio.sleep(0.01)
                     continue
 
-                # ----- State: Disconnected, waiting to reconnect -----
                 await asyncio.sleep(0.1)
 
             except Exception as e:
-                log("RNode BLE poll error: " + str(e), LOG_ERROR)
-                import sys
-
-                sys.print_exception(e)
+                diag_print("Poll Loop Error: " + str(e))
                 await asyncio.sleep(1)
 
-        log("RNode BLE poll loop EXITED for " + self.name, LOG_ERROR)
-
-    # ==================================================================
-    # BLE IRQ Handler
-    # ==================================================================
-
     def _irq(self, event, data):
-        """Central BLE IRQ handler — dispatches all BLE events."""
         try:
             if event == _IRQ_PERIPHERAL_CONNECT:
                 self._on_connect(data)
             elif event == _IRQ_PERIPHERAL_DISCONNECT:
                 self._on_disconnect(data)
             elif event == _IRQ_SCAN_RESULT:
-                self._on_scan_result(data)
+                if self._target_addr_found is None and self._match_scan_result(
+                    data[0], bytes(data[1]), bytes(data[4])
+                ):
+                    self._target_addr_found = (data[0], bytes(data[1]))
             elif event == _IRQ_SCAN_DONE:
-                self._on_scan_done(data)
+                self._scanning = False
+                if self._target_addr_found is None:
+                    self._scan_result = False
             elif event == _IRQ_GATTC_SERVICE_RESULT:
                 self._on_service_result(data)
             elif event == _IRQ_GATTC_SERVICE_DONE:
@@ -1740,85 +883,55 @@ class RNodeBLEInterface(Interface):
             elif event == _IRQ_GATTC_NOTIFY:
                 self._on_notify(data)
             elif event == _IRQ_MTU_EXCHANGED:
-                conn_handle, mtu = data
-                if conn_handle == self._conn_handle:
-                    self._negotiated_mtu = mtu
-                    self._mtu_exchanged = True
-                    log("RNode BLE MTU exchanged: " + str(mtu), LOG_DEBUG)
+                if data[0] == self._conn_handle:
+                    self._negotiated_mtu, self._mtu_exchanged = data[1], True
             elif event == _IRQ_ENCRYPTION_UPDATE:
-                conn_handle, encrypted, authenticated, bonded, key_size = data
-                if conn_handle == self._conn_handle:
+                if data[0] == self._conn_handle:
+                    conn_handle = data[0]
+                    encrypted = bool(data[1])
+                    authenticated = bool(data[2]) if len(data) > 2 else False
+                    bonded = bool(data[3]) if len(data) > 3 else False
+
                     self._encrypted = encrypted
-                    log(
-                        "RNode BLE encryption: enc="
-                        + str(encrypted)
-                        + " bond="
-                        + str(bonded)
-                        + " key_size="
-                        + str(key_size),
-                        LOG_NOTICE,
+                    diag_print(
+                        "Encryption Update: encrypted={}, authenticated={}, bonded={}".format(
+                            encrypted, authenticated, bonded
+                        )
                     )
+                    if self._encrypted:
+                        diag_print("Encrypted link established!")
+                        self._already_bonded = True
+                        self._bonded_dirty = (
+                            True  # Safely scheduled outside the interrupt context
+                        )
             elif event == _IRQ_PASSKEY_ACTION:
-                conn_handle, action, passkey = data
-                if conn_handle == self._conn_handle:
+                if data[0] == self._conn_handle:
+                    conn_handle, action, passkey = data
+                    diag_print(
+                        "Passkey Action requested: action={}, passkey={}".format(
+                            action, passkey
+                        )
+                    )
                     self._on_passkey_action(action, passkey)
+            elif event == _IRQ_GET_SECRET:
+                return self._on_get_secret(data)
+            elif event == _IRQ_SET_SECRET:
+                return self._on_set_secret(data)
         except Exception as e:
-            log("RNode BLE IRQ error (event=" + str(event) + "): " + str(e), LOG_ERROR)
-
-    def _on_scan_result(self, data):
-        """Handle _IRQ_SCAN_RESULT: check if this device matches our target.
-
-        MicroPython ESP32-C6 callback signature:
-            addr_type, addr, adv_type, rssi, adv_data = data
-        addr and adv_data are memoryview – must copy before leaving IRQ.
-        """
-        addr_type, addr, adv_type, rssi, adv_data = data
-        # Copy memoryview to bytes – required since data is only valid during IRQ
-        addr = bytes(addr)
-        adv_data = bytes(adv_data)
-
-        if self._target_addr_found is not None:
-            return
-
-        if self._match_scan_result(addr_type, addr, adv_data):
-            self._target_addr_found = (addr_type, addr)
-            self.rssi = rssi
-
-    def _on_scan_done(self, data):
-        """Handle _IRQ_SCAN_DONE: scan period ended."""
-        self._scanning = False
-        if self._target_addr_found is None:
-            self._scan_result = False
-
-    # ==================================================================
-    # Cleanup
-    # ==================================================================
+            diag_print("IRQ Error: {}".format(e))
 
     def close(self):
-        """Shutdown the RNode BLE interface."""
-        self._shutting_down = True
-        self.online = False
-        self.enabled = False
-
+        self._shutting_down = self.online = self.enabled = False
         self._stop_scan()
         self._disconnect()
-
-        # Give BLE stack time to process disconnect
         time.sleep_ms(100)
-
         if self._ble:
             try:
                 self._ble.active(False)
-            except:
+            except Exception:
                 pass
-
-        self._kiss_buf = bytearray()
-        self._write_queue = []
-        self._detected = False
-        self._radio_configured = False
-
+        self._kiss_buf, self._write_queue = bytearray(), []
         super().close()
-        log("RNode BLE " + self.name + " closed", LOG_NOTICE)
 
     def __str__(self):
         return "RNodeBLEInterface[" + self.name + "]"
