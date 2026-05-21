@@ -6,8 +6,8 @@ import time
 
 import serial
 
-RNODE_PORT = "/dev/cu.usbmodem23401"  # your RNode
-C6_PORT = "/dev/cu.usbmodem23101"  # your C6 - adjust
+RNODE_PORT = "/dev/cu.usbmodem23201"  # your RNode
+C6_PORT = "/dev/cu.usbmodem23401"  # your C6 - adjust
 
 
 class LineReader:

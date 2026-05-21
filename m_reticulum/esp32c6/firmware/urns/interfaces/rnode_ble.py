@@ -129,6 +129,8 @@ class RNodeBLEInterface(Interface):
                 os.remove("ble_bond.json")
                 os.remove("bonded.txt")
                 os.remove("force_pair.txt")
+                # Force instant sync of file deletions to SPI flash
+                os.sync()
                 self._already_bonded = False
             except Exception:
                 pass
@@ -144,6 +146,7 @@ class RNodeBLEInterface(Interface):
             )
         except Exception:
             try:
+                import os
                 import random
 
                 import network
@@ -157,6 +160,8 @@ class RNodeBLEInterface(Interface):
                 temp_mac[0] = 0x02
                 with open("ble_mac.txt", "w") as f:
                     f.write(temp_mac.hex())
+                # Sync new MAC file directly to SPI flash
+                os.sync()
                 diag_print(
                     "Generated persistent MAC: "
                     + ":".join("%02x" % b for b in temp_mac)
@@ -248,17 +253,21 @@ class RNodeBLEInterface(Interface):
 
             raw = {}
             for k, v in self._secrets.items():
-                # Save as pure hex string to enforce compliant byte serialization
                 raw["{},{}".format(k[0], k[1].hex())] = v.hex()
             with open("ble_bond.json", "w") as f:
                 json.dump(raw, f)
+            # Sync keys instantly to SPI flash to prevent data loss on power pulls
+            import os
+
+            os.sync()
         except Exception:
             pass
 
     def _on_get_secret(self, data):
+        # Unpack parameters: sec_type, index, key
         sec_type, index, key = data[0], data[1], data[2]
         if key is None:
-            # Index-based query: Return the index'th bytes secret value for this sec_type, or None
+            # Index-based query: return the index'th value (bytes) for this sec_type, or None if not found
             i = 0
             for (s, k), v in self._secrets.items():
                 if s == sec_type:
@@ -637,6 +646,10 @@ class RNodeBLEInterface(Interface):
                     try:
                         with open("bonded.txt", "w") as f:
                             f.write("1")
+                        # Force instant sync of bond flag to physical flash
+                        import os
+
+                        os.sync()
                         diag_print("Bonding status saved to bonded.txt")
                     except Exception as e:
                         diag_print("Failed to save bonding status: " + str(e))
@@ -717,9 +730,7 @@ class RNodeBLEInterface(Interface):
                                 # Proactively inject the PIN after a short delay so NimBLE can authenticate.
                                 asyncio.create_task(self._proactive_pin_injection())
                             except Exception as e:
-                                diag_print(
-                                    "gap_pair() fresh pairing trigger failed: " + str(e)
-                                )
+                                diag_print("gap_pair() trigger failed: " + str(e))
                                 self._disconnect()
                                 continue
                         else:
@@ -760,6 +771,7 @@ class RNodeBLEInterface(Interface):
                                 import os
 
                                 os.remove("bonded.txt")
+                                os.sync()
                             except Exception:
                                 pass
                             self._already_bonded = False
