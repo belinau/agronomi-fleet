@@ -6,7 +6,7 @@ import time
 
 import serial
 
-RNODE_PORT = "/dev/cu.usbmodem23101"  # your RNode
+RNODE_PORT = "/dev/cu.usbmodem23401"  # your RNode
 C6_PORT = "/dev/cu.usbmodem23201"  # your C6 - adjust
 
 

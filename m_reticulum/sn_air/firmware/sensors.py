@@ -30,8 +30,8 @@ def read_dht22(pin, retries=3):
     """Read temperature and humidity from a DHT22 sensor (blocking).
 
     The DHT22 requires a 2-second stabilisation period after power-on or
-    deep-sleep wake.  This function blocks for that duration plus any
-    retry delays.  Use read_dht22_async() instead if running inside an
+    deep-sleep wake. This function blocks for that duration plus any
+    retry delays. Use read_dht22_async() instead if running inside an
     asyncio event loop.
 
     Args:
@@ -181,7 +181,8 @@ def read_battery(pin, divider_ratio=2.0, samples=4):
     """
     try:
         adc = machine.ADC(pin)
-        adc.atten(machine.ADC.ATTN_DB11)  # 0–3.3 V range
+        # ATTENUATION FIX: Complies with modern MicroPython releases
+        adc.atten(machine.ADC.ATTN_11DB)  # 0–3.3 V range
 
         total = 0
         for _ in range(samples):
@@ -255,7 +256,7 @@ async def read_all_async(config):
     """Read all air-node sensors and return a dict (async version).
 
     Uses async DHT22 reading so the event loop is not blocked during
-    the 2-second stabilisation wait.  Battery ADC read is fast enough
+    the 2-second stabilisation wait. Battery ADC read is fast enough
     to be synchronous.
 
     Args:

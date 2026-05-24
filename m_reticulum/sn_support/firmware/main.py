@@ -22,7 +22,6 @@ import time
 import config
 import machine
 import uasyncio as asyncio
-
 from urns import Reticulum
 from urns.destination import Destination
 from urns.identity import Identity
@@ -34,12 +33,13 @@ from urns.packet import Packet
 # ---------------------------------------------------------------------------
 
 _hub_identity = None
-_lxm_router   = None
+_lxm_router = None
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _log(msg, level=1):
     if config.DEBUG >= level:
@@ -55,6 +55,7 @@ def _get_rns_interface_name(rns):
 
 def _connect_wifi(ssid, password, timeout=15):
     import network
+
     wlan = network.WLAN(network.STA_IF)
     wlan.active(False)
     time.sleep(0.1)
@@ -92,6 +93,7 @@ def _find_or_create_identity(storage_path):
 def _read_battery_v():
     try:
         from machine import ADC, Pin
+
         adc = ADC(Pin(config.BAT_ADC_PIN))
         adc.atten(ADC.ATTN_11DB)
         raw = adc.read()
@@ -104,6 +106,7 @@ def _read_battery_v():
 # ---------------------------------------------------------------------------
 # LXMF command handler
 # ---------------------------------------------------------------------------
+
 
 def _on_lxmf_delivery(message):
     try:
@@ -132,6 +135,7 @@ def _on_lxmf_delivery(message):
 # Announce handler
 # ---------------------------------------------------------------------------
 
+
 def _on_announce(destination_hash, app_data, packet):
     global _hub_identity
     if app_data is None:
@@ -156,12 +160,13 @@ def _on_announce(destination_hash, app_data, packet):
 # Telemetry builder — battery only
 # ---------------------------------------------------------------------------
 
+
 def _build_telemetry(bat_v, interface_name):
     t = {
-        "dev_id":        config.NODE_NAME,
-        "device_type":   config.DEVICE_TYPE,
-        "fw_ver":        config.FIRMWARE_VERSION,
-        "gateway_id":    config.NODE_NAME,
+        "dev_id": config.NODE_NAME,
+        "device_type": config.DEVICE_TYPE,
+        "fw_ver": config.FIRMWARE_VERSION,
+        "gateway_id": config.NODE_NAME,
         "rns_interface": interface_name,
     }
     if bat_v is not None:
@@ -173,6 +178,7 @@ def _build_telemetry(bat_v, interface_name):
 # Async main
 # ---------------------------------------------------------------------------
 
+
 async def main():
     global _hub_identity, _lxm_router
 
@@ -182,14 +188,7 @@ async def main():
     _log("=" * 40)
 
     # ------------------------------------------------------------------
-    # 1. Initialise µReticulum FIRST — before WiFi.
-    #    RNodeBLEInterface.__init__ calls wlan.active(True) internally
-    #    to generate/load the persistent BLE MAC address. If WiFi is
-    #    already connected at that point, the wlan.active() call
-    #    disrupts it and the interface constructor throws, causing
-    #    setup_interfaces() to silently drop the BLE interface.
-    #    It also reads ble_pin.txt / force_pair.txt / ble_bond.json
-    #    itself — main.py does not need to touch those files.
+    # 1. Initialise µReticulum FIRST — before WiFi
     # ------------------------------------------------------------------
     try:
         rns = Reticulum(loglevel={0: 0, 1: 0, 2: 2}.get(config.DEBUG, 0))
@@ -206,10 +205,11 @@ async def main():
         return
 
     # ------------------------------------------------------------------
-    # 2. Connect WiFi now — safe because BLE MAC setup is already done
+    # 2. Connect WiFi now
     # ------------------------------------------------------------------
     wifi_interfaces = [
-        i for i in config.CONFIG.get("interfaces", [])
+        i
+        for i in config.CONFIG.get("interfaces", [])
         if i.get("enabled", True)
         and i.get("type", "") in ("UDPInterface", "TCPClientInterface")
     ]
@@ -240,7 +240,7 @@ async def main():
     # 4. Wait for interface online
     # ------------------------------------------------------------------
     _log("Waiting for interface to come online...")
-    iface_timeout  = 45
+    iface_timeout = 45
     iface_deadline = time.ticks_add(time.ticks_ms(), iface_timeout * 1000)
 
     while time.ticks_diff(iface_deadline, time.ticks_ms()) > 0:
@@ -257,14 +257,18 @@ async def main():
     # ------------------------------------------------------------------
     _lxm_router = LXMRouter(storagepath=storage)
     lxmf_dest = _lxm_router.register_delivery_identity(
-        ident, display_name=config.NODE_NAME,
+        ident,
+        display_name=config.NODE_NAME,
     )
     _lxm_router.register_delivery_callback(_on_lxmf_delivery)
     _log("LXMF delivery dest: " + lxmf_dest.hexhash)
 
     cmd_dest = Destination(
-        ident, Destination.IN, Destination.SINGLE,
-        config.COMMAND_APP, config.COMMAND_ASPECT,
+        ident,
+        Destination.IN,
+        Destination.SINGLE,
+        config.COMMAND_APP,
+        config.COMMAND_ASPECT,
     )
     cmd_dest.set_proof_strategy(Destination.PROVE_ALL)
     cmd_dest._announce_handler = _on_announce
@@ -284,34 +288,29 @@ async def main():
     # 7. Wait for hub announce (must yield so BLE packets are processed)
     # ------------------------------------------------------------------
     _log("Waiting for hub announce...")
-    hub_timeout  = 60
+    hub_timeout = 60
     hub_deadline = time.ticks_add(time.ticks_ms(), hub_timeout * 1000)
 
     while _hub_identity is None and time.ticks_diff(hub_deadline, time.ticks_ms()) > 0:
         await asyncio.sleep_ms(500)
 
     # ------------------------------------------------------------------
-    # 8. Send telemetry
+    # 8. Send telemetry via LXMF
     # ------------------------------------------------------------------
     iface_name = _get_rns_interface_name(rns)
-    payload    = json.dumps(_build_telemetry(bat_v, iface_name)).encode("utf-8")
+    payload = json.dumps(_build_telemetry(bat_v, iface_name)).encode("utf-8")
 
     if _hub_identity is not None:
         tx_dest = Destination(
-            _hub_identity, Destination.OUT, Destination.SINGLE,
-            config.TELEMETRY_APP, config.TELEMETRY_ASPECT,
+            _hub_identity, Destination.OUT, Destination.SINGLE, "lxmf", "delivery"
         )
-        _log("Telemetry -> SINGLE (hub known)")
+        lxm = LXMessage(tx_dest, lxmf_dest, payload)
+        _lxm_router.handle_outbound(lxm)
+        _log("Telemetry routed via LXMF to Hub: " + _hub_identity.hexhash)
     else:
-        _log("WARN: hub not found — sending PLAIN")
-        tx_dest = Destination(
-            None, Destination.OUT, Destination.PLAIN,
-            config.TELEMETRY_APP, config.TELEMETRY_ASPECT,
+        _log(
+            "WARN: hub not found — skipping telemetry (LXMF requires recipient identity)"
         )
-
-    receipt = Packet(tx_dest, payload, Packet.DATA).send()
-    _log("Telemetry " + ("sent" if receipt else "FAILED") +
-         " (" + str(len(payload)) + " bytes)")
 
     # ------------------------------------------------------------------
     # 9. Listen for LXMF commands

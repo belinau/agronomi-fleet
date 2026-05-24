@@ -151,17 +151,12 @@ CONFIG = {
     ],
 }
 
-# ---- Hub destination ----
+# ---- Hub discovery aspect ----
 TELEMETRY_APP = "farm"
 TELEMETRY_ASPECT = "telemetry_readings"
 COMMAND_APP = "farm"
 COMMAND_ASPECT = "gateway_commands"
 
-# ---- RNS announce prefix ----
 RNS_ANNOUNCE_PREFIX = "agronomi-sensor"
-
-# Hub announce app_data filter — only accept announces from hubs
 HUB_ANNOUNCE_FILTER = "agronomi"
-
-# ---- LXMF address (discovered via announce if empty) ----
 SENSOR_HUB = ""

@@ -103,12 +103,15 @@ def get_db() -> sqlite3.Connection:
 # COMMAND DISPATCHER (LXMF COMPATIBLE)
 # ---------------------------------------------------------------------------
 class OutboundCommandDispatcher:
-    def __init__(self, lxm_router):
+    def __init__(self, lxm_router, local_lxmf_target):
         self.lxm_router = lxm_router
+        self.local_lxmf_target = local_lxmf_target
         self.running = True
 
     def poll_loop(self):
-        RNS.log("[COMMAND ENGINE] Outbound queue scheduler loop active.")
+        RNS.log(
+            "[COMMAND ENGINE] Outbound queue scheduler loop active.", RNS.LOG_NOTICE
+        )
         while self.running:
             try:
                 conn = get_db()
@@ -136,20 +139,43 @@ class OutboundCommandDispatcher:
                         continue
 
                     RNS.log(
-                        f"[COMMAND ROUTE] Relaying LXM command request '{cmd_type}' targeting <{dest_hex}>"
+                        f"[COMMAND ROUTE] Relaying LXM command request '{cmd_type}' targeting <{dest_hex}>",
+                        RNS.LOG_NOTICE,
                     )
                     clean_hex = dest_hex.replace("<", "").replace(">", "").strip()
                     dest_bytes = RNS.hex2bytes(clean_hex)
 
-                    command_payload = json.dumps({"cmd": cmd_type}).encode("utf-8")
-                    outbound_lxm = LXMF.LXMessage(
-                        dest=dest_bytes,
-                        source=self.lxm_router.address,
-                        content=command_payload,
-                        title="Actuator System Directive",
+                    # Recall the node's Identity using its destination hash
+                    recipient_identity = RNS.Identity.recall(dest_bytes)
+                    if not recipient_identity:
+                        RNS.log(
+                            f"[COMMAND REJECT] Identity not resolved for {dev_id}.",
+                            RNS.LOG_WARNING,
+                        )
+                        continue
+
+                    # Construct a proper RNS.Destination object as expected by the LXMessage constructor
+                    dest = RNS.Destination(
+                        recipient_identity,
+                        RNS.Destination.OUT,
+                        RNS.Destination.SINGLE,
+                        "lxmf",
+                        "delivery",
                     )
 
-                    # VERIFIED API CALL
+                    # Structure command packet natively inside standard LXMF fields
+                    command_payload = {"cmd": cmd_type}
+
+                    # Instantiate LXMessage correctly with the Destination object
+                    outbound_lxm = LXMF.LXMessage(
+                        destination=dest,
+                        source=self.local_lxmf_target,
+                        content=b"",
+                        title="Actuator System Directive",
+                        fields=command_payload,
+                    )
+
+                    # Hand off to the LXMF router
                     self.lxm_router.handle_outbound(outbound_lxm)
 
                     conn.execute(
@@ -166,11 +192,49 @@ class OutboundCommandDispatcher:
 
 
 # ---------------------------------------------------------------------------
+# GLOBAL ANNOUNCE HANDLER (Hub Side Discovery Layer)
+# ---------------------------------------------------------------------------
+# This handler receives announcements on your custom aspect and registers
+# the nodes' public keys into Reticulum's identity cache natively
+class NodeDiscoveryHandler:
+    def __init__(self, aspect_filter):
+        self.aspect_filter = aspect_filter
+
+    def received_announce(self, destination_hash, announced_identity, app_data):
+        if app_data is None:
+            return
+        try:
+            data_str = (
+                app_data.decode("utf-8")
+                if isinstance(app_data, (bytes, bytearray))
+                else str(app_data)
+            )
+            # Logs peer discovery natively at notice level
+            RNS.log(
+                f"[DISCOVERY] Learned identity for node: {RNS.prettyhexrep(destination_hash)} | Metadata: {data_str}",
+                RNS.LOG_NOTICE,
+            )
+        except Exception as e:
+            RNS.log(
+                f"[DISCOVERY ERROR] Failed parsing node announcement: {e}",
+                RNS.LOG_WARNING,
+            )
+
+
+# ---------------------------------------------------------------------------
 # CENTRAL CORE ARCHITECTURE
 # ---------------------------------------------------------------------------
 class FarmLXMFHub:
     def __init__(self):
-        self.reticulum = RNS.Reticulum()
+        # Support alternative config directories via standard -c or --config arguments
+        config_dir = None
+        for i, arg in enumerate(sys.argv):
+            if arg in ("--config", "-c") and i + 1 < len(sys.argv):
+                config_dir = sys.argv[i + 1]
+                break
+
+        # Standard initialization allows dynamic sharing or standalone mode on host
+        self.reticulum = RNS.Reticulum(configdir=config_dir, loglevel=RNS.LOG_NOTICE)
         self.identity = self._load_or_create_identity()
 
         # VERIFIED API INITIALIZATION
@@ -189,10 +253,27 @@ class FarmLXMFHub:
             self.identity, display_name=display_string
         )
 
+        # Discovery Announcement Destination (Matches node config: farm.gateway_commands)
+        self.cmd_dest = RNS.Destination(
+            self.identity,
+            RNS.Destination.IN,
+            RNS.Destination.SINGLE,
+            "farm",
+            "gateway_commands",
+        )
+
+        # Register standard global announce handler to capture and cache ESP32 node public keys
+        self.discovery_handler = NodeDiscoveryHandler(
+            aspect_filter="farm.gateway_commands"
+        )
+        RNS.Transport.register_announce_handler(self.discovery_handler)
+
         RNS.log(
-            f"[CORE INIT] Unified LXMF Ingestion Target Ready: <{self.hub_addr_hex}>"
+            f"[CORE INIT] Unified LXMF Ingestion Target Ready: <{self.hub_addr_hex}>",
+            RNS.LOG_NOTICE,
         )
         self.lxm_router.announce(self.lxmf_local_target.hash)
+        self.cmd_dest.announce(app_data=b"agronomi")
 
     def _load_or_create_identity(self) -> RNS.Identity:
         if os.path.exists(IDENTITY_PATH):
@@ -200,7 +281,8 @@ class FarmLXMFHub:
                 ident = RNS.Identity.from_file(IDENTITY_PATH)
                 if ident:
                     RNS.log(
-                        f"[CORE] Loaded root system identity: {RNS.prettyhexrep(ident.hash)}"
+                        f"[CORE] Loaded root system identity: {RNS.prettyhexrep(ident.hash)}",
+                        RNS.LOG_NOTICE,
                     )
                     return ident
             except Exception as e:
@@ -211,29 +293,38 @@ class FarmLXMFHub:
         ident = RNS.Identity()
         ident.to_file(IDENTITY_PATH)
         RNS.log(
-            f"[CORE] Minted new system identity hash: {RNS.prettyhexrep(ident.hash)}"
+            f"[CORE] Minted new system identity hash: {RNS.prettyhexrep(ident.hash)}",
+            RNS.LOG_NOTICE,
         )
         return ident
 
     def _on_lxm_received(self, lxm_message):
         """Callback executed by LXMRouter when a verified LXM message is delivered."""
+        # FAILSAFE DIAGNOSTIC LOG (Bypasses all routing, DB, and JSON parsing checks)
+        RNS.log("[DEBUG HUB] _on_lxm_received callback triggered!", RNS.LOG_ERROR)
         try:
-            content_bytes = lxm_message.content
-            raw_payload = content_bytes.decode("utf-8")
+            # Standard LXMF: Read the msgpacked fields dictionary natively (bypasses JSON entirely)
+            fields = lxm_message.fields
 
-            if "{" in raw_payload:
-                raw_payload = raw_payload[
-                    raw_payload.find("{") : raw_payload.rfind("}") + 1
-                ]
+            # Robust fallback to support legacy JSON in message content if needed
+            if not fields and lxm_message.content:
+                try:
+                    raw_payload = lxm_message.content_as_string()
+                    if "{" in raw_payload:
+                        raw_payload = raw_payload[
+                            raw_payload.find("{") : raw_payload.rfind("}") + 1
+                        ]
+                    fields = json.loads(raw_payload)
+                except Exception:
+                    pass
 
-            data = json.loads(raw_payload)
-
-            if "dev_id" in data and "bat_v" in data:
-                src_hex = RNS.prettyhexrep(lxm_message.source)
+            if fields and "dev_id" in fields:
+                src_hex = lxm_message.source_hash.hex()
                 RNS.log(
-                    f"[TELEMETRY INGEST] Decoded LXM frame from device: {data['dev_id']} | Source: <{src_hex}>"
+                    f"[TELEMETRY INGEST] Decoded LXM fields from device: {fields['dev_id']} | Source: <{src_hex}>",
+                    RNS.LOG_NOTICE,
                 )
-                self._write_telemetry_to_db(data, src_hex)
+                self._write_telemetry_to_db(fields, src_hex)
         except Exception as e:
             RNS.log(
                 f"[DROP] Failed parsing incoming LXM frame payload: {e}", RNS.LOG_ERROR
@@ -242,6 +333,13 @@ class FarmLXMFHub:
     def _write_telemetry_to_db(self, data, source_hex: str):
         now_str = datetime.now().isoformat()
         node_id = data["dev_id"]
+
+        # Support both compact and verbose keys dynamically
+        device_type = data.get("type", data.get("device_type", "support_node"))
+        firmware_version = data.get("fw", data.get("fw_ver"))
+        rns_interface = data.get("if", data.get("rns_interface", "wifi"))
+        battery_level = data.get("bat", data.get("bat_v", -1.0))
+
         try:
             conn = get_db()
             with conn:
@@ -253,13 +351,22 @@ class FarmLXMFHub:
                         last_seen = excluded.last_seen,
                         battery_level = excluded.battery_level
                 """,
-                    (node_id, node_id, now_str, data["bat_v"]),
+                    (node_id, node_id, now_str, battery_level),
                 )
 
                 conn.execute(
                     """
-                    INSERT INTO hardware_devices (device_id, device_type, node_id, rns_identity_hash, rns_destination_hash, rns_interface, firmware_version, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO hardware_devices (
+                        device_id,
+                        device_type,
+                        node_id,
+                        rns_identity_hash,
+                        rns_destination_hash,
+                        rns_interface,
+                        firmware_version,
+                        last_seen
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(device_id) DO UPDATE SET
                         rns_destination_hash = excluded.rns_destination_hash,
                         rns_interface = excluded.rns_interface,
@@ -267,24 +374,86 @@ class FarmLXMFHub:
                 """,
                     (
                         node_id,
-                        data.get("device_type", "support_node"),
+                        device_type,
                         node_id,
                         source_hex,
-                        data.get("rns_interface", "wifi"),
-                        data.get("fw_ver"),
+                        source_hex,
+                        rns_interface,
+                        firmware_version,
                         now_str,
                     ),
                 )
 
+                # Record battery voltage (always present)
                 conn.execute(
                     """
                     INSERT INTO sensor_readings (node_id, reading_type, value, unit, recorded_at)
                     VALUES (?, 'battery_voltage', ?, 'V', ?)
                 """,
-                    (node_id, data["bat_v"], now_str),
+                    (node_id, battery_level, now_str),
                 )
+
+                # Extract nested readings dictionary (or fallback directly to flat dictionary)
+                readings = (
+                    data.get("readings", {})
+                    if isinstance(data.get("readings"), dict)
+                    else {}
+                )
+
+                # --- 1. SN-AIR-01 Node Readings ---
+                # Check both compact and verbose keys
+                air_temp = readings.get(
+                    "temp", readings.get("air_temp_c", data.get("temp"))
+                )
+                air_temp_valid = readings.get("air_temp_valid", air_temp is not None)
+                if air_temp_valid and air_temp is not None:
+                    conn.execute(
+                        """
+                        INSERT INTO sensor_readings (node_id, reading_type, value, unit, recorded_at)
+                        VALUES (?, 'air_temperature', ?, 'C', ?)
+                    """,
+                        (node_id, air_temp, now_str),
+                    )
+
+                air_hum = readings.get(
+                    "hum", readings.get("air_humidity_pct", data.get("hum"))
+                )
+                air_hum_valid = readings.get("air_humidity_valid", air_hum is not None)
+                if air_hum_valid and air_hum is not None:
+                    conn.execute(
+                        """
+                        INSERT INTO sensor_readings (node_id, reading_type, value, unit, recorded_at)
+                        VALUES (?, 'air_humidity', ?, '%', ?)
+                    """,
+                        (node_id, air_hum, now_str),
+                    )
+
+                # --- 2. SN-SOIL-01 Node Readings ---
+                soil_moisture = readings.get("soil_moisture_pct", data.get("moist"))
+                if soil_moisture is not None and soil_moisture >= 0.0:
+                    conn.execute(
+                        """
+                        INSERT INTO sensor_readings (node_id, reading_type, value, unit, recorded_at)
+                        VALUES (?, 'soil_moisture', ?, '%', ?)
+                    """,
+                        (node_id, soil_moisture, now_str),
+                    )
+
+                soil_temp = readings.get("soil_temp_c", data.get("soil_temp"))
+                soil_temp_valid = readings.get("soil_temp_valid", soil_temp is not None)
+                if soil_temp_valid and soil_temp is not None:
+                    conn.execute(
+                        """
+                        INSERT INTO sensor_readings (node_id, reading_type, value, unit, recorded_at)
+                        VALUES (?, 'soil_temperature', ?, 'C', ?)
+                    """,
+                        (node_id, soil_temp, now_str),
+                    )
+
+            # ALIGNED LOGGING: Explicitly set to LOG_NOTICE
             RNS.log(
-                f"[DB Sync] Successfully synchronized telemetry entries for {node_id}"
+                f"[DB Sync] Successfully synchronized telemetry entries for {node_id}",
+                RNS.LOG_NOTICE,
             )
         except Exception as e:
             RNS.log(
@@ -296,18 +465,29 @@ if __name__ == "__main__":
     setup_hub_logging()
     hub_app = FarmLXMFHub()
 
-    dispatcher = OutboundCommandDispatcher(hub_app.lxm_router)
+    # Pass the local delivery target directly to the dispatcher
+    dispatcher = OutboundCommandDispatcher(
+        hub_app.lxm_router, hub_app.lxmf_local_target
+    )
     dispatch_thread = threading.Thread(target=dispatcher.poll_loop, daemon=True)
     dispatch_thread.start()
 
     try:
         while True:
             time.sleep(30)
+            # Announce the LXMF target so nodes can consistently resolve routing paths
             hub_app.lxm_router.announce(hub_app.lxmf_local_target.hash)
+            # Announce the command channel destination so the nodes can autoprovision
+            hub_app.cmd_dest.announce(app_data=b"agronomi")
+            # ALIGNED LOGGING: Explicitly set to LOG_NOTICE
             RNS.log(
-                "[RNS Shared Daemon] Dispatched standard LXMF target identity announce."
+                "[RNS Shared Daemon] Dispatched standard LXMF target and command channel announces.",
+                RNS.LOG_NOTICE,
             )
     except KeyboardInterrupt:
-        RNS.log("System shutdown operation called. Closing active processing slots...")
+        RNS.log(
+            "System shutdown operation called. Closing active processing slots...",
+            RNS.LOG_NOTICE,
+        )
         dispatcher.running = False
         sys.exit(0)

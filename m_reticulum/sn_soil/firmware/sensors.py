@@ -30,7 +30,8 @@ def read_soil_moisture(pin, calib_dry, calib_wet, samples=8):
     """
     try:
         adc = machine.ADC(pin)
-        adc.atten(machine.ADC.ATTN_DB11)  # 0–3.3 V range (≈ ADC_11db)
+        # ATTENUATION FIX: Complies with modern MicroPython releases
+        adc.atten(machine.ADC.ATTN_11DB)  # 0–3.3 V range
 
         total = 0
         for _ in range(samples):
@@ -145,7 +146,8 @@ def read_battery(pin, divider_ratio=2.0, samples=4):
     """
     try:
         adc = machine.ADC(pin)
-        adc.atten(machine.ADC.ATTN_DB11)  # 0–3.3 V range
+        # ATTENUATION FIX: Complies with modern MicroPython releases
+        adc.atten(machine.ADC.ATTN_11DB)  # 0–3.3 V range
 
         total = 0
         for _ in range(samples):
