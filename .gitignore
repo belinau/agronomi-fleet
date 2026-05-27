@@ -15,14 +15,6 @@
 farm_hub.identity
 gateway.identity
 
-# --- WiFi credentials (per-device, never commit) ---
-secrets.py
-
-# --- Per-device secrets directory ---
-# Contains placeholder templates (tracked) and real credentials (not tracked).
-# Template files have "YourWiFi" placeholders and are added with: git add -f
-m_reticulum/secrets/*/secrets.py
-
 # --- Python bytecode ---
 __pycache__/
 *.pyc
@@ -66,3 +58,8 @@ agronomi-firmware/
 AGENTS.md
 CLAUDE.md
 documents/lxmf_storage/lxmf/
+
+# --- Per-device real credentials (NEVER tracked) ---
+# Real WiFi/secret values live in m_reticulum/secrets/<node>/secrets.py.
+# Placeholder templates live in each node's firmware/secrets.py (tracked).
+m_reticulum/secrets/

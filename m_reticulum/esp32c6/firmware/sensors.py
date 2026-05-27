@@ -48,13 +48,13 @@ def read_all(config):
 
     Args:
         config: Module or dict with keys:
-            BAT_ADC_PIN, BAT_DIVIDER_RATIO.
+            PIN_BAT_ADC, BAT_DIVIDER_RATIO.
 
     Returns:
         dict with key: battery_v
     """
     pin_bat = (
-        config.BAT_ADC_PIN if hasattr(config, "BAT_ADC_PIN") else config["BAT_ADC_PIN"]
+        config.PIN_BAT_ADC if hasattr(config, "PIN_BAT_ADC") else config["PIN_BAT_ADC"]
     )
     ratio = (
         config.BAT_DIVIDER_RATIO

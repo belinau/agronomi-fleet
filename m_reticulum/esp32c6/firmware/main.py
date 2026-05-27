@@ -1,21 +1,20 @@
 """µReticulum — ESP32-C6 Template Node Firmware
 
-Template for battery-powered sensor nodes using µReticulum.
-Copy this folder, customise config.py and sensors.py for your hardware.
+Generic sensor-class skeleton — copy to a new node folder and add
+sensor-specific code in sensors.py + telemetry fields here
 
 Lifecycle:
-  1. Initialise µReticulum + interfaces (RNodeBLEInterface reads ble_pin.txt,
-     force_pair.txt, ble_mac.txt itself — do NOT connect WiFi before this,
-     as wlan.active(True) inside RNodeBLEInterface.__init__ conflicts)
-  2. Connect WiFi (after interfaces are constructed)
-  3. Start BLE poll loops + transport job loop
-  4. Wait for interface online
-  5. Set up LXMRouter for LXMF receive
-  6. Announce on command channel
-  7. Read sensors, send telemetry via LXMF fields
-  8. Wait for hub announce (yielding to event loop each tick)
-  9. Listen for inbound LXMF commands (5 s)
- 10. Deep sleep
+  1. Boot → init RNS / interfaces / identity
+  2. Announce on farm.node, wait for hub announce
+  3. Read sensors (template placeholder — battery only)
+  4. Send telemetry as RNS.Packet to hub's farm.hub
+  5. Send fw_check
+  6. Listen for commands / OTA Link (60s, extended to 300s if firmware push pending)
+  7. Deep sleep
+
+All transport is direct RNS Link + Packet — no LXMF.  OTA uses the
+chunked Link protocol from m_reticulum/sn_support/firmware/updater.py
+(shared, byte-identical across nodes).
 """
 
 import gc
@@ -24,30 +23,21 @@ import time
 import config
 import machine
 import uasyncio as asyncio
-from sensors import read_all
-from urns import Reticulum
+from urns import Reticulum, umsgpack
 from urns.destination import Destination
 from urns.identity import Identity
-from urns.lxmf import LXMessage, LXMRouter
 from urns.packet import Packet
 
-# ---------------------------------------------------------------------------
-# Globals
-# ---------------------------------------------------------------------------
-
 _hub_identity = None
-_hub_lxmf_hash = None
-_lxm_router = None
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+_fw_update_pending = False
+_rns_instance = None
+_ble_interface_class = None
+_ble_config_dict = None
 
 
 def _log(msg, level=1):
     if config.DEBUG >= level:
-        print("[TEMPLATE] " + str(msg))
+        print("[NODE] " + str(msg))
 
 
 def _get_rns_interface_name(rns):
@@ -95,42 +85,199 @@ def _find_or_create_identity(storage_path):
 
 
 def _read_battery_v():
-    """Read battery voltage from ADC, return voltage or None on error."""
     try:
         from machine import ADC, Pin
-
-        adc = ADC(Pin(config.BAT_ADC_PIN))
+        adc = ADC(Pin(config.PIN_BAT_ADC))
         adc.atten(ADC.ATTN_11DB)
         raw = adc.read()
         return (raw / 4095.0) * 3.3 * config.BAT_DIVIDER_RATIO
-    except Exception as e:
-        _log("Battery read error: " + str(e), 2)
+    except Exception:
         return None
 
 
-# ---------------------------------------------------------------------------
-# LXMF command handler
-# ---------------------------------------------------------------------------
-
-
-def _on_lxmf_delivery(message):
+def _suspend_ble_interface(rns):
+    """Take BLE LoRa interface offline during WiFi-mode OTA — see
+    m_reticulum/sn_support/firmware/main.py for the full rationale
+    (urns doesn't pin link-associated packets to their attached_interface).
+    """
+    global _ble_interface_class, _ble_config_dict
     try:
-        fields = message.fields or {}
-        cmd = fields.get("cmd", "")
-        _log("LXMF command: " + cmd, 1)
-        # Add command handlers here, e.g.:
-        # if cmd == "reset": machine.reset()
+        from urns.transport import Transport
+
+        target_iface = None
+        for iface in rns.interfaces:
+            if iface.__class__.__name__ == "RNodeBLEInterface":
+                target_iface = iface
+                break
+
+        if target_iface:
+            _ble_interface_class = target_iface.__class__
+            for cfg in config.CONFIG.get("interfaces", []):
+                if cfg.get("type") == "RNodeBLEInterface":
+                    _ble_config_dict = cfg
+                    break
+
+            target_iface.close()
+            if target_iface in rns.interfaces:
+                rns.interfaces.remove(target_iface)
+            if (
+                hasattr(Transport, "interfaces")
+                and target_iface in Transport.interfaces
+            ):
+                Transport.interfaces.remove(target_iface)
+
+            _log("Physically disconnected BLE RNode for firmware priority window", 1)
     except Exception as e:
-        _log("LXMF handler error: " + str(e), 1)
+        _log("BLE suspend failed: " + str(e), 1)
 
 
-# ---------------------------------------------------------------------------
-# Announce handler — discovers the hub and seeds destination hashes
-# ---------------------------------------------------------------------------
+def _resume_ble_interface(rns):
+    """Re-create the BLE LoRa interface and re-register it with RNS Transport.
+
+    Mirrors what urns.Reticulum.setup_interfaces does for a single interface:
+    instantiate the class with the config dict (constructor signature is
+    `__init__(self, config)` — passing `rns` was a stale bug), apply IFAC,
+    append to rns.interfaces, register with Transport, then start its
+    poll loop.  Without the registration steps the new interface exists
+    but Transport.outbound() never picks it for routing.
+    """
+    global _ble_interface_class, _ble_config_dict
+    try:
+        if _ble_interface_class and _ble_config_dict:
+            _log("Re-instantiating BLE interface for parallel operation...", 1)
+            from urns.transport import Transport
+
+            new_iface = _ble_interface_class(_ble_config_dict)
+            new_iface.setup_ifac(_ble_config_dict)
+            rns.interfaces.append(new_iface)
+            Transport.register_interface(new_iface)
+
+            if hasattr(new_iface, "poll_loop"):
+                asyncio.create_task(new_iface.poll_loop())
+
+            _log("Resumed parallel BLE/LoRa transport interface", 1)
+            _ble_interface_class = None
+            _ble_config_dict = None
+    except Exception as e:
+        _log("BLE resume failed: " + str(e), 1)
+
+
+def _on_packet_received(data, packet):
+    try:
+        fields = umsgpack.unpackb(data)
+        cmd = fields.get("cmd", "")
+
+        _log("Packet received: cmd={}".format(cmd), 1)
+
+        if cmd == "fw_check_ack":
+            if fields.get("pending"):
+                global _fw_update_pending
+                _fw_update_pending = True
+                _log("Hub signaled pending update — keeping active connection", 1)
+            else:
+                _log("Hub has no firmware update pending", 1)
+                _resume_ble_interface(_rns_instance)
+            return
+
+        if cmd == "execute":
+            cmd_type = fields.get("type", "")
+            _handle_hardware_command(cmd_type)
+
+    except Exception as e:
+        _log("Packet callback error: " + str(e), 1)
+
+
+def _handle_hardware_command(cmd):
+    # Template sensor node — no relays or actuators attached.  Stub
+    # logs anything unexpected for diagnostic purposes.
+    _log("Unknown/unsupported command for sensor node: " + str(cmd), 1)
+
+
+def _on_link_established(link):
+    _log("Stateful Link connected from Hub", 1)
+
+    def _packet_handler(data, packet):
+        _on_link_packet(data, packet, link)
+
+    link.set_packet_callback(_packet_handler)
+    link.resource_concluded_callback = _on_resource_concluded
+
+
+def _on_link_packet(data, packet, link):
+    global _fw_update_pending
+    try:
+        fields = umsgpack.unpackb(data)
+        cmd = fields.get("cmd", "")
+
+        _log("Link control packet: cmd={}".format(cmd), 1)
+
+        if cmd == "manifest_query":
+            import updater
+            requested = fields.get("files", []) or []
+            manifest = updater.compute_file_manifest(requested)
+            try:
+                link.send(umsgpack.packb({
+                    "cmd": "manifest_response",
+                    "manifest": manifest,
+                }))
+                _log("manifest_response: {} entries".format(len(manifest)), 1)
+            except Exception as e:
+                _log("manifest_response send error: " + str(e), 1)
+            return
+
+        if cmd == "update_begin":
+            import updater
+            updater.handle_update_begin(fields)
+            _fw_update_pending = True
+
+        elif cmd in ("update_file", "update_commit"):
+            import updater
+            resp = updater.handle_update(fields)
+
+            if cmd == "update_commit":
+                if resp.get("status") == "ok":
+                    staged = updater.list_staged_files()
+                    _log(
+                        "Firmware staging complete ({} files). rebooting...".format(
+                            len(staged)
+                        ),
+                        1,
+                    )
+                    time.sleep_ms(500)
+                    machine.reset()
+                else:
+                    _log("Commit failed: {}".format(resp.get("error")), 1)
+                    _fw_update_pending = True
+
+    except Exception as e:
+        _log("Link control error: " + str(e), 1)
+
+
+def _on_resource_concluded(resource):
+    global _fw_update_pending
+    try:
+        from urns.resource import COMPLETE
+        if resource.status == COMPLETE:
+            data = resource.data
+            fields = umsgpack.unpackb(data)
+            cmd = fields.get("cmd", "")
+
+            if cmd == "update_file":
+                import updater
+                resp = updater.handle_update(fields)
+                if resp.get("status") == "ok":
+                    _log("Saved: {}".format(resp.get("filename")), 1)
+                    _fw_update_pending = True
+                else:
+                    _log("Staging failed: {}".format(resp.get("error")), 1)
+        else:
+            _log("Resource transfer did not complete successfully", 1)
+    except Exception as e:
+        _log("Resource processing error: " + str(e), 1)
 
 
 def _on_announce(destination_hash, app_data, packet):
-    global _hub_identity, _hub_lxmf_hash
+    global _hub_identity
     if app_data is None:
         return
     try:
@@ -140,33 +287,19 @@ def _on_announce(destination_hash, app_data, packet):
             else str(app_data)
         )
         _log("Announce from " + destination_hash.hex()[:8] + ": " + data_str, 2)
-        if _hub_identity is None:
+        if _hub_identity is None and data_str == "agronomi_hub":
             ident = Identity.recall(destination_hash)
             if ident is not None:
                 _hub_identity = ident
-                _hub_lxmf_hash = Destination.hash(ident, "lxmf", "delivery")
-                # Seed the hub's public key under its lxmf.delivery destination hash
-                # so send_message can find it via Identity.recall(). The hub's
-                # farm.gateway_commands announce stores the key under that aspect's
-                # hash, but send_message needs it under the lxmf.delivery hash.
-                Identity.remember(None, _hub_lxmf_hash, ident.get_public_key())
                 _log("Hub discovered: " + ident.hexhash)
     except Exception as e:
         _log("Announce handler error: " + str(e), 2)
 
 
-# ---------------------------------------------------------------------------
-# Telemetry builder — flat LXMF fields dict
-# ---------------------------------------------------------------------------
-
-
 def _build_telemetry_fields(readings, interface_name):
-    """Build a flat dict of LXMF fields for telemetry delivery.
-
-    Uses short keys to keep content size small for opportunistic delivery.
-    Extend this dict with your own sensor fields.
-    """
+    """Template telemetry — extend with your sensor fields."""
     fields = {
+        "cmd": "telemetry",
         "dev_id": config.NODE_NAME,
         "type": config.DEVICE_TYPE,
         "fw": config.FIRMWARE_VERSION,
@@ -175,45 +308,18 @@ def _build_telemetry_fields(readings, interface_name):
     bat = readings.get("battery_v")
     if bat is not None:
         fields["bat"] = bat
-    # Add your sensor fields here, e.g.:
-    # fields["temp"] = readings["temp_c"]
-    # fields["hum"] = readings["humidity_pct"]
     return fields
 
 
-# ---------------------------------------------------------------------------
-# Async main
-# ---------------------------------------------------------------------------
-
-
 async def main():
-    global _hub_identity, _hub_lxmf_hash, _lxm_router
+    global _hub_identity, _fw_update_pending, _rns_instance
 
     gc.collect()
     _log("=" * 40)
-    _log(config.NODE_NAME + " boot — µReticulum v" + config.FIRMWARE_VERSION)
+    _log("NODE boot — µReticulum v" + config.FIRMWARE_VERSION)
     _log("=" * 40)
 
-    # ------------------------------------------------------------------
-    # 1. Initialise µReticulum FIRST — before WiFi
-    # ------------------------------------------------------------------
-    try:
-        rns = Reticulum(loglevel={0: 0, 1: 0, 2: 2}.get(config.DEBUG, 0))
-        rns.config = config.CONFIG
-        storage = rns.storagepath
-        ident = _find_or_create_identity(storage)
-        rns.identity = ident
-        rns.setup_interfaces()
-        _log("µReticulum initialised — identity: " + ident.hexhash)
-        _log("Interfaces: " + str([str(i) for i in rns.interfaces]))
-    except Exception as e:
-        _log("FATAL: µReticulum init failed: " + str(e))
-        _deep_sleep()
-        return
-
-    # ------------------------------------------------------------------
-    # 2. Connect WiFi now
-    # ------------------------------------------------------------------
+    wifi_connected = False
     wifi_interfaces = [
         i
         for i in config.CONFIG.get("interfaces", [])
@@ -224,12 +330,27 @@ async def main():
         try:
             ip = _connect_wifi(config.WIFI_SSID, config.WIFI_PASS)
             _log("WiFi connected — IP: " + ip)
+            wifi_connected = True
         except Exception as e:
-            _log("WiFi failed: " + str(e))
+            _log("WiFi offline, using LoRa: " + str(e))
 
-    # ------------------------------------------------------------------
-    # 3. Start poll loops
-    # ------------------------------------------------------------------
+    try:
+        rns = Reticulum(loglevel={0: 0, 1: 3, 2: 6}.get(config.DEBUG, 0))
+        rns.config = config.CONFIG
+        storage = rns.storagepath
+        ident = _find_or_create_identity(storage)
+        rns.identity = ident
+        rns.setup_interfaces()
+        _rns_instance = rns
+        _log("µReticulum initialised — identity: " + ident.hexhash)
+    except Exception as e:
+        _log("FATAL: µReticulum init failed: " + str(e))
+        _deep_sleep()
+        return
+
+    if wifi_connected:
+        _suspend_ble_interface(rns)
+
     from urns.transport import Transport
 
     poll_tasks = []
@@ -237,17 +358,13 @@ async def main():
         if hasattr(iface, "poll_loop"):
             task = asyncio.create_task(iface.poll_loop())
             poll_tasks.append(task)
-            _log("Started poll loop for " + str(iface))
 
     transport_task = asyncio.create_task(Transport.job_loop())
     poll_tasks.append(transport_task)
-    _log("Started transport job loop")
+    _log("Started transport task loops")
 
-    # ------------------------------------------------------------------
-    # 4. Wait for interface online
-    # ------------------------------------------------------------------
-    _log("Waiting for interface to come online...")
-    iface_timeout = 45
+    _log("Waiting for interfaces...")
+    iface_timeout = 5
     iface_deadline = time.ticks_add(time.ticks_ms(), iface_timeout * 1000)
 
     while time.ticks_diff(iface_deadline, time.ticks_ms()) > 0:
@@ -256,45 +373,28 @@ async def main():
             _log("Interface online: " + str(online[0]))
             break
         await asyncio.sleep_ms(500)
-    else:
-        _log("WARN: No interface online after " + str(iface_timeout) + "s")
-
-    # ------------------------------------------------------------------
-    # 5. LXMRouter for LXMF receive
-    # ------------------------------------------------------------------
-    _lxm_router = LXMRouter(storagepath=storage)
-    lxmf_dest = _lxm_router.register_delivery_identity(
-        ident,
-        display_name=config.NODE_NAME,
-    )
-    _lxm_router.register_delivery_callback(_on_lxmf_delivery)
-    _log("LXMF delivery dest: " + lxmf_dest.hexhash)
 
     cmd_dest = Destination(
         ident,
         Destination.IN,
         Destination.SINGLE,
-        config.COMMAND_APP,
-        config.COMMAND_ASPECT,
+        config.NODE_APP,
+        config.NODE_ASPECT,
     )
     cmd_dest.set_proof_strategy(Destination.PROVE_ALL)
+    cmd_dest.set_packet_callback(_on_packet_received)
+    cmd_dest.set_link_established_callback(_on_link_established)
     cmd_dest._announce_handler = _on_announce
 
-    # ------------------------------------------------------------------
-    # 6. Read sensors + announce
-    # ------------------------------------------------------------------
-    _log("Reading sensors...")
-    readings = read_all(config)
-    bat_v = readings.get("battery_v", -1.0)
-    _log("Battery:        {:.2f}V".format(bat_v))
+    _log("Node aspect registered: " + config.NODE_APP + "." + config.NODE_ASPECT)
 
+    # Announce + fw_check FIRST — a sensor failure must never block the node
+    # from joining the hub, otherwise we deadlock (no telemetry → no fw_check
+    # → no OTA fix possible from the hub).
     app_data = (config.RNS_ANNOUNCE_PREFIX + ":" + config.NODE_NAME).encode("utf-8")
     cmd_dest.announce(app_data=app_data)
-    _log("Announced on " + config.COMMAND_APP + "." + config.COMMAND_ASPECT)
+    _log("Announced on " + config.NODE_APP + "." + config.NODE_ASPECT)
 
-    # ------------------------------------------------------------------
-    # 7. Wait for hub announce (must yield so BLE packets are processed)
-    # ------------------------------------------------------------------
     _log("Waiting for hub announce...")
     hub_timeout = 60
     hub_deadline = time.ticks_add(time.ticks_ms(), hub_timeout * 1000)
@@ -302,48 +402,89 @@ async def main():
     while _hub_identity is None and time.ticks_diff(hub_deadline, time.ticks_ms()) > 0:
         await asyncio.sleep_ms(500)
 
-    # ------------------------------------------------------------------
-    # 8. Send telemetry via LXMF fields
-    # ------------------------------------------------------------------
     iface_name = _get_rns_interface_name(rns)
-
-    if _hub_lxmf_hash is not None:
-        # Re-announce ourselves now that we know the Hub is active.
-        # This guarantees the Hub receives and caches our public key.
-        cmd_dest.announce(app_data=app_data)
-
-        telemetry_fields = _build_telemetry_fields(readings, iface_name)
-        _lxm_router.send_message(_hub_lxmf_hash, content=b"", fields=telemetry_fields)
-        _log("Telemetry routed via LXMF fields to Hub: " + _hub_identity.hexhash)
-    else:
-        _log(
-            "WARN: hub not found — skipping telemetry (LXMF requires recipient identity)"
+    hub_dest = None
+    if _hub_identity is not None:
+        hub_dest = Destination(
+            _hub_identity,
+            Destination.OUT,
+            Destination.SINGLE,
+            config.HUB_APP,
+            config.HUB_ASPECT,
         )
 
-    # ------------------------------------------------------------------
-    # 9. Listen for LXMF commands
-    # ------------------------------------------------------------------
-    _log("Listening for commands (5 s)...")
-    await asyncio.sleep_ms(5000)
+        fw_check_fields = {
+            "cmd": "fw_check",
+            "dev_id": config.NODE_NAME,
+            "fw": config.FIRMWARE_VERSION,
+        }
+        Packet(hub_dest, umsgpack.packb(fw_check_fields)).send()
+        _log("fw_check packet sent to Hub", 1)
+    else:
+        _log("WARN: Hub not found")
 
-    # ------------------------------------------------------------------
-    # 10. Clean up + deep sleep
-    # ------------------------------------------------------------------
-    for task in poll_tasks:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    # Sensors come AFTER hub registration so a sensor failure can never
+    # take the node offline.
+    readings = {}
+    _log("Reading sensors...")
+    try:
+        readings = {"battery_v": _read_battery_v()}
+        if readings.get("battery_v") is not None:
+            _log("Battery:        {:.2f}V".format(readings["battery_v"]))
+    except Exception as e:
+        _log("Sensor read failed: " + str(e) + " — continuing without readings", 1)
 
-    for iface in rns.interfaces:
-        if hasattr(iface, "close"):
+    if hub_dest is not None:
+        telemetry_fields = _build_telemetry_fields(readings, iface_name)
+        Packet(hub_dest, umsgpack.packb(telemetry_fields)).send()
+        _log("Telemetry packet routed to Hub: " + _hub_identity.hexhash)
+
+    _log("Listening for commands...")
+
+    # Firmware is now fully booted, networked, and reached the listen
+    # loop — confirm this build so boot.py won't roll back next restart.
+    try:
+        import updater as _updater
+        _updater.confirm_running_firmware()
+    except Exception as e:
+        _log("confirm_running_firmware failed: " + str(e), 1)
+
+    listen_end = time.ticks_add(time.ticks_ms(), 60000)
+
+    while True:
+        now = time.ticks_ms()
+        if _fw_update_pending:
+            deadline = time.ticks_add(now, 300000)
+            if time.ticks_diff(deadline, listen_end) > 0:
+                listen_end = deadline
+            _fw_update_pending = False
+            _log("Firmware pending — extended listen to 300 s", 1)
+
+        if time.ticks_diff(listen_end, now) <= 0:
+            break
+        await asyncio.sleep_ms(200)
+
+    _resume_ble_interface(_rns_instance)
+
+    if not config.ENABLE_DEEPSLEEP:
+        _log("DEBUG MODE — staying alive.")
+        await _idle_loop()
+    else:
+        for task in poll_tasks:
+            task.cancel()
             try:
-                iface.close()
-            except Exception:
+                await task
+            except asyncio.CancelledError:
                 pass
 
-    _deep_sleep()
+        for iface in rns.interfaces:
+            if hasattr(iface, "close"):
+                try:
+                    iface.close()
+                except Exception:
+                    pass
+
+        _deep_sleep()
 
 
 def _deep_sleep():
@@ -353,8 +494,11 @@ def _deep_sleep():
         machine.deepsleep(config.SLEEP_INTERVAL_SEC * 1000)
     else:
         _log("DEBUG MODE — no deep sleep.")
-        while True:
-            time.sleep(1)
+
+
+async def _idle_loop():
+    while True:
+        await asyncio.sleep_ms(5000)
 
 
 asyncio.run(main())

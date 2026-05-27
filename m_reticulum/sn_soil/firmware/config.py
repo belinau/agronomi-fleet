@@ -1,20 +1,16 @@
-"""µReticulum — Soil Node Configuration (SN-SOIL-01)
+"""µReticulum — Soil Sensor Node Configuration (SN-SOIL-01)
 
-Transport topology:
-  SN-SOIL-01 has BLE + WiFi only (no LoRa module).
-
-  PRIMARY: BLE → RAK4631 RNode (via RNodeBLEInterface)
-  SECONDARY: WiFi UDP (greenhouse/indoor with WiFi coverage)
+Hardware: ESP32-C6 Super Mini
+Transport: BLE → RAK4631 RNode (LoRa), WiFi TCP to hub
+Sensors:   capacitive soil moisture (ADC), DS18B20 (1-wire), battery ADC
 """
 
-# ---- Node settings ----
+# ---- Node identity ----
 NODE_NAME = "SN-SOIL-01"
 DEVICE_TYPE = "soil_node"
-FIRMWARE_VERSION = "2.0.0-mr"  # -mr = microreticulum
+FIRMWARE_VERSION = "2.0.1-mr"
 
 # ---- WiFi ----
-# Credentials are loaded from secrets.py (not tracked by git).
-# If secrets.py is missing, WiFi is disabled (BLE-only mode).
 WIFI_SSID = ""
 WIFI_PASS = ""
 try:
@@ -27,19 +23,22 @@ except ImportError:
     pass
 
 # ---- Deep sleep ----
-ENABLE_DEEPSLEEP = False  # Set to True for production
+ENABLE_DEEPSLEEP = False
 SLEEP_INTERVAL_SEC = 300
 
-# ---- Sensor pins (ESP32-C6 Super Mini) ----
+# ---- Sensor pins ----
 PIN_SOIL_ADC = 2
 PIN_ONEWIRE = 3
-PIN_BAT_ADC = 1
 
 # ---- Soil moisture calibration ----
-CALIB_DRY_V = 1.815  # Voltage in air
-CALIB_WET_V = 1.378  # Voltage in water
+CALIB_DRY_V = 1.815  # voltage in air
+CALIB_WET_V = 1.378  # voltage in water
 
-# ---- DEBUG levels: 0 = silent, 1 = messages, 2 = full ----
+# ---- Battery ADC (100k/100k divider on GPIO1) ----
+PIN_BAT_ADC = 1
+BAT_DIVIDER_RATIO = 2.0
+
+# ---- Logging: 0=silent 1=info 2=debug ----
 DEBUG = 1
 
 # ---- RNS interfaces ----
@@ -50,8 +49,8 @@ CONFIG = {
         {
             "type": "RNodeBLEInterface",
             "name": "RNode BLE",
-            "target_name": "",  # auto-discover by NUS UUID
-            "pairing_passkey": 0,  # overwritten from ble_pin.txt at boot
+            "target_name": "",            # auto-discover by NUS UUID
+            "pairing_passkey": 0,         # overwritten from ble_pin.txt at boot
             "frequency": 868000000,
             "bandwidth": 125000,
             "spreadingfactor": 11,
@@ -64,20 +63,23 @@ CONFIG = {
             "name": "WiFi UDP",
             "listen_port": 4242,
             "forward_port": 4242,
+            "enabled": False,
+        },
+        {
+            "type": "TCPClientInterface",
+            "name": "Field node to AgroNomi TCP",
+            "target_host": "Urbans-Mac-mini.local",
+            "target_port": 4243,
             "enabled": True,
         },
     ],
 }
 
-# ---- Hub destinations ----
-TELEMETRY_APP = "farm"
-TELEMETRY_ASPECT = "telemetry_readings"
-COMMAND_APP = "farm"
-COMMAND_ASPECT = "gateway_commands"
+# ---- Unified Hub & Node destinations ----
+HUB_APP = "farm"
+HUB_ASPECT = "hub"
+NODE_APP = "farm"
+NODE_ASPECT = "node"
 
-# ---- RNS announce prefix ----
+# ---- Announce ----
 RNS_ANNOUNCE_PREFIX = "agronomi-sensor"
-HUB_ANNOUNCE_FILTER = "agronomi"
-
-# ---- Hub LXMF address ----
-SENSOR_HUB = ""

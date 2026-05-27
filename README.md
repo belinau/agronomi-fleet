@@ -98,7 +98,13 @@ The hub runs `reticulum_ingest.py` on the Mac Mini. It needs:
 
 1. **RNS installed** — `pip install rns`
 2. **RNode connected** via USB — configured with `rnodeconf`
-3. **RNS config** — `~/.reticulum/config` with RNode interface and UDP interface
+3. **RNS config** — `~/.reticulum/config` with two enabled interfaces:
+   - `TCPServerInterface` on `listen_ip = 0.0.0.0`, `listen_port = 4243` — accepts inbound connections from nodes (LAN), and from any Tailscale peer.
+   - `RNodeInterface` for the USB-attached RNode (LoRa, 868 MHz / SF11).
+
+   `enable_transport = True` at the top so the hub can route Reticulum packets between its interfaces (needed so remote Tailscale peers can reach the LoRa/TCP nodes through this Mac).
+
+   The `UDPInterface` entry is left in the config file but `enabled = no` — see [Network topology](#network-hub--node-connectivity) for why.
 
 When a node announces, the hub automatically:
 - Discovers the node and records its identity
@@ -108,6 +114,79 @@ When a node announces, the hub automatically:
 When telemetry arrives, the hub:
 - Parses the LXMF fields
 - Writes each reading to `sensor_readings` as individual rows (`reading_type`, `value`, `unit`)
+
+## Network: hub ↔ node connectivity
+
+The hub and every node share two physical transports — **WiFi** (over TCP) and **LoRa** (over RNode radios). UDP is intentionally not used.
+
+| Channel | Used for | Why |
+|---|---|---|
+| **TCP / WiFi** | OTA firmware push, real-time commands, telemetry when WiFi is reachable | Reliable, supports the full 16 KB Resource MTU per part, no broadcast traffic on the LAN |
+| **LoRa via RNode** | Long-range telemetry, low-power deep-sleep mode, fallback when WiFi is unavailable | Survives without an IP network, range of kilometres |
+| ~~UDP broadcast~~ | (disabled) | ESP32 lwIP can't buffer multi-part Resources reliably under broadcast — multi-KB transfers fail with packet loss. TCP solves this cleanly. |
+
+### Address resolution — no hardcoded IPs
+
+The node's `config.py` points its `TCPClientInterface` at `Urbans-Mac-mini.local`, not at `192.168.178.93`. The Mac advertises this name via Bonjour (built into macOS, always on); ESP32 lwIP includes an mDNS resolver and resolves `*.local` names transparently via `socket.getaddrinfo()`. If the router hands the Mac a different IP after a reboot or lease change, **nothing on the node needs to change** — the next reconnect attempt resolves the new IP from mDNS.
+
+This is also why you do not need a DHCP reservation in the router. The Bonjour name is the stable identifier.
+
+If you change the Mac's name, get the canonical one with `scutil --get LocalHostName` and update `target_host` in each node's `config.py` accordingly. (Mixing Bonjour names across machines is fine — each node can point at a different hub.)
+
+### Remote access via Tailscale (optional)
+
+The fleet works end-to-end without Tailscale — that's just for reaching the ESP32s from outside your LAN (e.g. your laptop while travelling, or another Mac in a different building). The pattern is **subnet routing through the hub**: the Mac becomes a Tailscale subnet router that bridges Tailscale traffic into the local 192.168.178.0/24 LAN, so Tailscale clients can hit the ESP32s as if they were on the same network. The ESP32 itself never joins Tailscale (MicroPython has no first-party Tailscale client).
+
+```
+Your laptop on Tailscale          urbans-mac-mini             ESP32 fleet
+─────────────────────             ────────────────             ───────────
+[Tailscale client]                [Tailscale + Bonjour]        [192.168.178.x]
+  100.64.x.x ───── encrypted tunnel ────► 100.77.106.18
+                                          ║
+                                          ▼
+                                          enable_transport=True
+                                          ║
+                                          ▼
+                                          192.168.178.93 ─ LAN ► 192.168.178.128
+                                                                 (mDNS-resolved
+                                                                  via TCP:4243)
+```
+
+**What the user has to set up** (one-time on the Mac):
+
+1. **Advertise the LAN subnet** to Tailscale:
+   ```bash
+   tailscale set --advertise-routes=192.168.178.0/24
+   ```
+
+2. **Enable IPv4 forwarding** so the Mac actually routes between Tailscale and LAN:
+   ```bash
+   sudo sysctl -w net.inet.ip.forwarding=1
+   sudo sysctl -w net.inet6.ip6.forwarding=1
+
+   # Persist across reboots:
+   echo 'net.inet.ip.forwarding=1' | sudo tee -a /etc/sysctl.conf
+   echo 'net.inet6.ip6.forwarding=1' | sudo tee -a /etc/sysctl.conf
+   ```
+
+3. **Approve the route** in the Tailscale admin console (this is a one-click security gate that can't be set from CLI):
+   - Go to https://login.tailscale.com/admin/machines
+   - Click your Mac (`urbans-mac-mini`) → *Edit route settings*
+   - Toggle `192.168.178.0/24` on, Save
+
+Verify with `tailscale status --json` on the Mac — you should see `192.168.178.0/24` in the `PrimaryRoutes` field of the self entry.
+
+**What the user does NOT have to set up:**
+
+- No Tailscale client on the ESP32s — they reach the Mac over the local LAN as before.
+- No DHCP reservation in the router — mDNS handles IP changes.
+- No firewall hole-punching — Tailscale handles NAT traversal.
+- No port forwarding on the FRITZ!Box.
+- Nothing in `~/.reticulum/config` references Tailscale by name; `listen_ip = 0.0.0.0` catches inbound connections from every interface (LAN, Tailscale `utun4`, loopback).
+
+### When you'd add more interfaces
+
+If you later add a second hub (e.g. a Raspberry Pi field gateway), give it its own `TCPServerInterface` and a Bonjour name, then add a `TCPClientInterface` in each node's `config.py` pointing at `pi-gateway.local:4243` (or whatever you name it). Nodes can have multiple `TCPClientInterface` entries — Reticulum picks the best path automatically. The same mDNS principle applies: as long as the gateway broadcasts its name on the LAN, nodes find it without IPs.
 
 ## Node setup
 
@@ -207,7 +286,7 @@ Interface config in the `CONFIG` dict:
 ```python
 "interfaces": [
     {
-        "type": "RNodeBLEInterface",   # BLE → LoRa via RAK4631
+        "type": "RNodeBLEInterface",   # BLE → LoRa via RAK4631 (long range)
         "name": "RNode BLE",
         "frequency": 868000000,        # 868 MHz (EU) or 915 MHz (US)
         "spreadingfactor": 11,         # Must match hub RNode
@@ -216,14 +295,23 @@ Interface config in the `CONFIG` dict:
         "enabled": True,
     },
     {
-        "type": "UDPInterface",        # WiFi for indoor/greenhouse
+        "type": "TCPClientInterface",  # Reliable WiFi link to the hub
+        "name": "Field node to AgroNomi TCP",
+        "target_host": "Urbans-Mac-mini.local",  # mDNS — no hardcoded IP
+        "target_port": 4243,
+        "enabled": True,
+    },
+    {
+        "type": "UDPInterface",        # left for reference; disabled — see Network section
         "name": "WiFi UDP",
         "listen_port": 4242,
         "forward_port": 4242,
-        "enabled": True,
+        "enabled": False,
     },
 ]
 ```
+
+`target_host` is your hub's Bonjour name (find it with `scutil --get LocalHostName` on the Mac). The node uses mDNS to resolve it at connect time, so the Mac's IP can change without breaking anything.
 
 ### Adding a new sensor type
 
@@ -267,69 +355,136 @@ Without this seeding, `Identity.recall()` fails silently because RNS stores publ
 | BLE pairing fails | RNode not in pairing mode | Run `rnodeconf --bluetooth-pair` or set `serial_port` in config for auto-pairing |
 | Node won't wake from sleep | `ENABLE_DEEPSLEEP = False` in config | Set to `True` for production deployment |
 
-## Firmware updates
+## Firmware updates (OTA)
 
-Firmware updates are pushed over the mesh from the hub — no USB cable needed after initial flashing.
+Firmware updates push over the Reticulum mesh from the hub — no USB cable needed after the initial flash. The protocol handles ESP32-C6 heap constraints by chunking large files at the wire level.
 
 ### How it works
 
-1. You edit firmware files in this repo and commit them
-2. On the hub, run `firmware_push.py <device>` — it reads the files, hashes them, and sends them over LXMF to the node
-3. The node receives each file via `updater.py`, verifies the SHA-256 hash, and writes it to `/update/`
-4. After all files are sent, the hub sends an `update_commit` command
-5. The node writes a reboot marker and resets
-6. On next boot, `boot.py` moves files from `/update/` to `/` (overwriting old versions) and reboots again with fresh firmware
+1. You edit firmware files in this repo
+2. On the hub, run `tools/firmware_push.py <device> --version X.Y.Z` — it inserts a `firmware_pushes` row for that device type and version
+3. Next time the target node sends an `fw_check` packet (every boot), the hub dispatches the push
+4. The hub opens an RNS Link to the node, sends `update_begin`, then streams each file as one or more `RNS.Resource` transfers
+5. The node's `updater.py` accumulates chunks per filename, verifies the whole-file SHA-256 once the final chunk arrives, and writes the assembled file to `/update/<filename>`
+6. After all files are acked, the hub sends `update_commit`
+7. The node writes `/update/.reboot_needed` and calls `machine.reset()`
+8. On next boot, `boot.py → updater.check_pending_update()` moves files from `/update/` over `/` and reboots once more — `main.py` then loads the new firmware
 
-The update is atomic at the file level — each file is verified before writing, and the swap only happens on a clean boot. If power is lost mid-transfer, the old firmware stays intact.
+Atomicity: each file's chunks are SHA-256-verified at the receiver before `_transfer_state["received"]` is incremented. The reboot marker is only written if every expected file passed verification. Power loss before `update_commit` leaves no marker, and the staged `/update/` directory is wiped on the next `update_begin`.
 
-### Hub-side: pushing updates
+### Chunking protocol
+
+Each `update_file` Resource carries one chunk of one file plus enough metadata for the receiver to reassemble:
+
+| Field | Type | Purpose |
+|---|---|---|
+| `cmd` | str | Always `"update_file"` |
+| `filename` | str | Same for every chunk of one file |
+| `data` | bytes | This chunk's bytes (≤ `CHUNK_SIZE` on the sender) |
+| `sha256` | str (hex) | SHA-256 of the *whole* file — verified only on the last chunk |
+| `chunk_index` | int | 0-based chunk position |
+| `total_chunks` | int | Total chunks for this file (1 = whole file in one Resource) |
+| `index` / `total` | int | File position in the multi-file push (existing fields, unchanged) |
+
+The receiver opens the file in `"wb"` mode on `chunk_index == 0` (truncating any stale copy), in `"ab"` mode for every subsequent chunk, and feeds each chunk's bytes into a running `uhashlib.sha256`. On `chunk_index == total_chunks - 1`, it finalizes the hash and compares to the sender-provided whole-file `sha256`. Mismatch → the staged file is deleted and `_transfer_state["failed"]` increments. Match → `_transfer_state["received"]` increments. `update_commit` checks `received == file_count` before writing the reboot marker.
+
+A sender that omits `chunk_index` and `total_chunks` (or sets `total_chunks=1`) gets the original single-shot behavior — the protocol is fully backward-compatible with one-chunk-per-file pushes.
+
+### Why chunking — the heap constraint that drives `CHUNK_SIZE`
+
+The urns `Resource.assemble()` path allocates two full-size byte buffers simultaneously (concatenated `stream` + decrypted `plaintext`), so a 15 KB Resource needs ~30 KB of contiguous heap. On ESP32-C6 with BLE + WiFi + crypto state already loaded, the largest available contiguous chunk by the time firmware push runs is ~6 KB. Anything larger fails with `MemoryError: allocating XXXXX bytes`, which propagates out of `Transport.inbound` before the local try/except in `assemble()` can catch it — the link is then poisoned and the rest of the transfer hangs.
+
+`CHUNK_SIZE = 4096` in `documents/reticulum_ingest.py` keeps every Resource's plaintext under that ceiling with comfortable headroom. If you ever profile a different ESP32 variant with more heap, raise this knob. If you target a constrained-er board, lower it — the receiver doesn't care about the value, only that chunks arrive in order.
+
+### Hub-side: queueing a push
 
 ```bash
-# Push latest firmware to a node (version auto-detected from config.py)
-python3 tools/firmware_push.py sn_air
+# Queue a push for one device type (creates a row in firmware_pushes)
+python3 tools/firmware_push.py sn_air --version 2.6.0-mr
 
-# Push a specific version
-python3 firmware_push.py an_pump --version 2.1.0-mr
+# Without --version, version is read from m_reticulum/<device>/firmware/config.py
+python3 tools/firmware_push.py an_pump
 
-# Push files but don't trigger reboot (apply on next manual/deep-sleep reboot)
-python3 firmware_push.py an_greenhouse --no-reboot
-
-# Dry run — show what would be sent without actually sending
-python3 firmware_push.py sn_soil --dry-run
+# Stage but don't trigger reboot (apply on next manual restart)
+python3 tools/firmware_push.py an_greenhouse --no-reboot
 ```
 
-### Node-side: update receiver
+The hub's `reticulum_ingest.py` picks up the queued row on the node's next `fw_check`. If you queue a push for a version the node already runs, the dispatcher marks the row `'sent'` without dispatching — no re-push loop.
 
-Each node includes `updater.py` (shared from `esp32c6/firmware/updater.py`). It handles two LXMF commands:
+### Node-side: receiver
 
-- `update_file` — receives a file, verifies SHA-256, writes to `/update/<filename>`
-- `update_commit` — writes reboot marker, triggers immediate reset
+Each node has `updater.py` (identical copy across `m_reticulum/*/firmware/`, synchronized from `esp32c6/firmware/updater.py`). It handles three control commands:
 
-`boot.py` checks for pending updates on every boot (including deep-sleep wakeups) and applies them before `main.py` loads.
+- `update_begin` — initializes `_transfer_state`, clears `/update/` of stale files
+- `update_file` — receives a chunk (see protocol table above)
+- `update_commit` — verifies all-files-received count, writes `.reboot_needed`, calls `machine.reset()`
+
+`boot.py → updater.check_pending_update()` runs on every boot (including deep-sleep wakeups) and applies pending updates before `main.py` loads.
 
 ### Files involved
 
-| File | Sent over mesh | Staged to | Purpose |
+| File | OTA-pushed | Staged to | Purpose |
 |------|--------------|-----------|---------|
-| `main.py` | ✓ | `/update/main.py` | Node firmware |
+| `main.py` | ✓ (chunked if > 4 KB) | `/update/main.py` | Node runtime |
 | `config.py` | ✓ | `/update/config.py` | Node configuration |
 | `sensors.py` | ✓ | `/update/sensors.py` | Sensor drivers |
-| `boot.py` | ✓ | `/update/boot.py` | Boot script (including update logic) |
-| `updater.py` | ✓ | `/update/updater.py` | Update receiver module |
+| `boot.py` | ✓ | `/update/boot.py` | Boot script (handles staging) |
+| `updater.py` | ✓ (chunked if > 4 KB) | `/update/updater.py` | OTA receiver module |
 | `secrets.py` | ✗ never | — | WiFi credentials (stays on device) |
-| `identity` | ✗ never | — | Node identity (stays on device) |
+| `identity` | ✗ never | — | Node identity keypair (stays on device) |
 
-### USB fallback
+### USB is for first-deployment only
 
-For initial flashing or recovery, use `mpremote`:
+A node needs one USB flash on the bench before it goes to the field — to put MicroPython, the `urns/` library, and the initial firmware on the device. After that the node never needs to be touched physically: every firmware change reaches it over the mesh, and failures are self-recovering.
 
 ```bash
-mpremote cp main.py :main.py
-mpremote cp config.py :config.py
-mpremote cp sensors.py :sensors.py
-mpremote cp boot.py :boot.py
-mpremote cp updater.py :updater.py
+# One-time, bench only, before deployment:
+mpremote cp m_reticulum/<device>/firmware/boot.py      :boot.py
+mpremote cp m_reticulum/<device>/firmware/updater.py   :updater.py
+mpremote cp m_reticulum/<device>/firmware/main.py      :main.py
+mpremote cp m_reticulum/<device>/firmware/config.py    :config.py
+mpremote cp m_reticulum/<device>/firmware/sensors.py   :sensors.py
+mpremote cp m_reticulum/<device>/firmware/secrets.py   :secrets.py
 ```
+
+### Will it work over LoRa-only (no WiFi)?
+
+Yes — the protocol is transport-agnostic. If the node has only `RNodeBLEInterface` online, RNS routes the Link over LoRa via the RAK4631. Chunked Resources work the same way; they're just slower. At 868 MHz / SF11 / BW125 the link is ~1.3 kbps, so a 4 KB chunk is ~25 s on the air. A full 5-file push with `main.py` + `updater.py` (each ~15 KB → 4 chunks) is around 10-15 minutes. `_suspend_ble_interface` only fires if WiFi connects, so pure-LoRa boots leave LoRa up automatically.
+
+### What's handled in code (not just hand-waved)
+
+Every layer of failure has a recovery path on the node itself — no USB intervention in the field.
+
+**Transient failures during transfer (handled at hub):**
+
+- **Chunk-level Resource FAILED.** Hub-side `MAX_FILE_ATTEMPTS = 3` retries each chunk on the existing link. The receiver discards a half-received chunk on the next `chunk_index=0`.
+- **Whole-push failure** (link drop, repeated chunk failure, receiver cancel). Hub-side `_run_fw_push` re-queues the push (`status='pending'`, `retries++`) instead of marking it `'failed'`. The next `fw_check` from the node re-dispatches automatically. After `MAX_PUSH_RETRIES = 5` re-queues for the same row, the hub gives up so a genuinely broken build doesn't loop forever.
+- **Same-version pending rows.** The dispatcher auto-marks them `'sent'` on the first `fw_check` from a node already running that version. No re-push storms.
+
+**Catastrophic failures (handled at node):**
+
+- **Power loss mid-transfer.** The reboot marker is only written if every file's whole-file SHA-256 matched. Without it, `boot.py` does nothing and `main.py` runs the old firmware. The half-staged files in `/update/` are wiped on the next `update_begin`.
+- **Power loss mid-apply** (after `update_commit`, during the rename loop). Backups of every overwritten file live at `/backup_<name>.py`; the `.unconfirmed` marker is written *before* any new file lands. On next boot the rollback path restores backups.
+- **Newly applied firmware crashes on import** (syntax error, missing import, top-level exception). `boot.py` wraps `import main` in `try/except`; any failure triggers `machine.reset()`. The `.unconfirmed` boot counter increments. After `_MAX_UNCONFIRMED_BOOTS = 3` resets without `confirm_running_firmware()` being called, `boot.py` restores `/backup_<name>.py` over the running files and resets again. Old firmware is back.
+- **Newly applied firmware imports OK but crashes before reaching steady state** (init code throws, hub never discovered, network never up). Same path — `asyncio.run(main())` propagates the exception out, `boot.py`'s try/except catches it, reset, counter increments, eventually rollback.
+- **Newly applied firmware runs but degrades after some time.** Once `main.py` has reached the listen loop and called `updater.confirm_running_firmware()`, the `.unconfirmed` marker is gone and backups are deleted. Subsequent crashes still reset (because `boot.py` wraps `import main` in try/except) but don't roll back — we've already accepted this firmware as good. If you actually want to revert further back, queue an OTA push of the prior version.
+
+**Confirmation contract:** `updater.confirm_running_firmware()` is the explicit signal that the new firmware is good enough to keep. It's called from every node's `main.py` immediately before entering its main listen loop. If you fork a node's `main.py`, don't skip this call — without it, every new firmware push will roll back after three boots.
+
+**Files involved in the rollback machinery:**
+
+| Marker / file | Set by | Cleared by | Purpose |
+|---|---|---|---|
+| `/update/.reboot_needed` | hub via `update_commit` packet | `updater.check_pending_update` once apply starts | "Apply staged files on next boot" |
+| `/update/.unconfirmed` | `updater.check_pending_update` before any rename | `updater.confirm_running_firmware()` from `main.py` | "We've applied a new build, hasn't proven itself yet" |
+| `/update/.boot_count` | `boot.py` on every unconfirmed boot | `updater.confirm_running_firmware()` or `boot.py` after rollback | Counts how many resets the unconfirmed build survived |
+| `/backup_<name>.py` | `updater._backup_current_files` before move | `updater.confirm_running_firmware()` or `boot.py` after rollback | Atomic rename target for the file being overwritten |
+
+### Performance notes worth knowing
+
+- **Per-Resource proof timing.** RNS hardcodes the sender-side `AWAITING_PROOF` retry to 3 × `(rtt × 3 + 10s grace) ≈ 46 s`. If a chunk's prove path on the node ever exceeds that (pure-Python bz2 decompression of a compressed chunk can be tens of seconds on RISC-V), the hub gives up on that chunk and the app-layer retry kicks in. This is why `RNS.Resource` is built with `auto_compress=False` — the receiver never has to bz2-decompress, so prove stays in single-digit milliseconds. If you ever build a native `bz2_fast_*.mpy` for your specific board, you can flip this back on to shrink wire size.
+- **Per-device serialization.** The dispatcher processes one push at a time per device type. Queueing pushes for both an SN-AIR and an SN-SOIL works fine — they serialize naturally as each node's `fw_check` arrives.
+- **TCP connection-reset warnings after commit.** Expected and cosmetic. The node calls `machine.reset()` immediately after the commit packet, which closes its half of the TCP socket. The hub's `TCPInterface` logs the reset; the next reconnect cycle restores the link.
 
 ## File structure
 
