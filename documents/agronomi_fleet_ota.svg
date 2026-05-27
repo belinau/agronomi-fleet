@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 660" role="img" aria-label="Firmware update over a Reticulum Link with automatic rollback">
+  <title>AgroNomi Fleet — OTA updates over a Reticulum Link</title>
+  <desc>Sequence diagram: hub queues a push, opens a Reticulum Link to the node, exchanges a manifest, streams files as 4 KB chunks, the node verifies each file by SHA-256, commits, reboots, and re-registers on the new version. A side panel shows the rollback path when the new firmware fails to confirm itself.</desc>
+
+  <rect width="820" height="660" rx="14" fill="#0f172a"/>
+
+  <!-- Title -->
+  <text x="410" y="42" text-anchor="middle" font-family="system-ui, sans-serif" font-size="20" font-weight="700" fill="#f1f5f9">Firmware update over a Reticulum Link</text>
+  <text x="410" y="64" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#94a3b8">chunked · SHA-256 per file · auto-rollback if the new build never confirms</text>
+
+  <!-- Hub column -->
+  <g>
+    <rect x="50" y="95" width="170" height="46" rx="9" fill="#0d9488" stroke="#5eead4" stroke-width="1.5"/>
+    <text x="135" y="118" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="600" fill="#f0fdfa">HUB</text>
+    <text x="135" y="134" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#a7f3d0">reticulum_ingest.py</text>
+    <!-- vertical timeline -->
+    <line x1="135" y1="141" x2="135" y2="600" stroke="#475569" stroke-width="1.5" stroke-dasharray="3 4"/>
+  </g>
+
+  <!-- Node column -->
+  <g>
+    <rect x="425" y="95" width="170" height="46" rx="9" fill="#1f2937" stroke="#9ca3af" stroke-width="1.5"/>
+    <text x="510" y="118" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="600" fill="#f3f4f6">NODE</text>
+    <text x="510" y="134" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#d1d5db">main.py · updater.py</text>
+    <!-- vertical timeline -->
+    <line x1="510" y1="141" x2="510" y2="600" stroke="#475569" stroke-width="1.5" stroke-dasharray="3 4"/>
+  </g>
+
+  <!-- Arrow marker -->
+  <defs>
+    <marker id="arrow-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0L10 5L0 10z" fill="#cbd5e1"/>
+    </marker>
+    <marker id="arrow-l" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M10 0L0 5L10 10z" fill="#cbd5e1"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0L10 5L0 10z" fill="#fb923c"/>
+    </marker>
+  </defs>
+
+  <!-- Step 1: fw_check (node → hub) -->
+  <line x1="510" y1="165" x2="135" y2="165" stroke="#cbd5e1" stroke-width="1.5" marker-end="url(#arrow-l)"/>
+  <text x="322" y="158" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#f1f5f9">1 · fw_check (current version)</text>
+
+  <!-- Step 2: open Link (hub → node) -->
+  <line x1="135" y1="200" x2="510" y2="200" stroke="#cbd5e1" stroke-width="1.5" marker-end="url(#arrow-r)"/>
+  <text x="322" y="193" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#f1f5f9">2 · open Reticulum Link</text>
+
+  <!-- Step 3: manifest_query (hub → node) -->
+  <line x1="135" y1="232" x2="510" y2="232" stroke="#cbd5e1" stroke-width="1.5" marker-end="url(#arrow-r)"/>
+  <text x="322" y="225" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#f1f5f9">3 · manifest_query</text>
+
+  <!-- Step 4: manifest_response (node → hub) -->
+  <line x1="510" y1="262" x2="135" y2="262" stroke="#cbd5e1" stroke-width="1.5" marker-end="url(#arrow-l)"/>
+  <text x="322" y="255" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#f1f5f9">4 · manifest_response (file hashes)</text>
+  <text x="322" y="278" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#94a3b8">files already correct are skipped</text>
+
+  <!-- Step 5: update_begin -->
+  <line x1="135" y1="305" x2="510" y2="305" stroke="#cbd5e1" stroke-width="1.5" marker-end="url(#arrow-r)"/>
+  <text x="322" y="298" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#f1f5f9">5 · update_begin</text>
+
+  <!-- Step 6: chunks block -->
+  <rect x="165" y="320" width="315" height="76" rx="8" fill="#1e293b" stroke="#fb923c" stroke-width="1.2"/>
+  <text x="180" y="340" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#fb923c">6 · stream files as 4 KB chunks</text>
+  <text x="180" y="358" font-family="system-ui, sans-serif" font-size="10" fill="#fed7aa">boot.py · config.py · main.py · sensors.py · updater.py</text>
+  <text x="180" y="375" font-family="system-ui, sans-serif" font-size="10" fill="#cbd5e1">running SHA-256 per chunk · whole-file hash on the last chunk</text>
+  <text x="180" y="390" font-family="system-ui, sans-serif" font-size="10" fill="#cbd5e1">mismatch → file is dropped, push is retried</text>
+  <line x1="480" y1="358" x2="510" y2="358" stroke="#fb923c" stroke-width="1.5" marker-end="url(#arrow-orange)"/>
+
+  <!-- Step 7: update_commit -->
+  <line x1="135" y1="425" x2="510" y2="425" stroke="#cbd5e1" stroke-width="1.5" marker-end="url(#arrow-r)"/>
+  <text x="322" y="418" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#f1f5f9">7 · update_commit</text>
+
+  <!-- Step 8-10: node-local actions -->
+  <rect x="395" y="442" width="230" height="80" rx="8" fill="#1f2937" stroke="#9ca3af" stroke-width="1"/>
+  <text x="408" y="461" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#f3f4f6">8 · backup current files</text>
+  <text x="408" y="478" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#f3f4f6">9 · move /update/* → /</text>
+  <text x="408" y="495" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#f3f4f6">10 · machine.reset()</text>
+  <text x="408" y="513" font-family="system-ui, sans-serif" font-size="9" fill="#9ca3af">writes /update/.unconfirmed before any rename</text>
+
+  <!-- Step 11: re-register at new version -->
+  <line x1="510" y1="555" x2="135" y2="555" stroke="#22c55e" stroke-width="1.8" marker-end="url(#arrow-l)"/>
+  <text x="322" y="548" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#22c55e">11 · fw_check at new version → confirm_running_firmware()</text>
+  <text x="322" y="572" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#86efac">unconfirmed marker cleared · backups deleted · update done</text>
+
+  <!-- Rollback panel -->
+  <g>
+    <rect x="635" y="155" width="170" height="380" rx="10" fill="#7f1d1d" stroke="#fca5a5" stroke-width="1.2" opacity="0.85"/>
+    <text x="720" y="180" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="#fef2f2">If something breaks</text>
+
+    <text x="720" y="208" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#fecaca">New main.py crashes</text>
+    <text x="720" y="222" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#fee2e2">boot.py catches it, resets</text>
+
+    <text x="720" y="248" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#fecaca">Counter increments</text>
+    <text x="720" y="262" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#fee2e2">/update/.boot_count</text>
+
+    <text x="720" y="288" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#fecaca">After 3 bad boots</text>
+    <text x="720" y="302" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#fee2e2">restore /backup_*.py</text>
+    <text x="720" y="316" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#fee2e2">over running files, reset</text>
+
+    <text x="720" y="346" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#fecaca">Old firmware back</text>
+    <text x="720" y="360" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#fee2e2">no USB · no field visit</text>
+
+    <text x="720" y="400" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#fde68a">Safe-mode escape</text>
+    <text x="720" y="416" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#fef3c7">hold BOOT (GPIO9)</text>
+    <text x="720" y="430" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#fef3c7">at reset → REPL only</text>
+
+    <text x="720" y="470" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#fed7aa" font-style="italic">Sensor failure ≠ offline.</text>
+    <text x="720" y="484" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#fed7aa" font-style="italic">Node still announces and</text>
+    <text x="720" y="498" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#fed7aa" font-style="italic">accepts OTA before reading</text>
+    <text x="720" y="512" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#fed7aa" font-style="italic">any sensor.</text>
+  </g>
+
+  <!-- Footer -->
+  <text x="410" y="625" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Same Reticulum Link works over WiFi or LoRa — protocol is transport-agnostic.</text>
+  <text x="410" y="644" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" fill="#94a3b8">Manifest-driven retries: a partial push picks up exactly where it left off.</text>
+
+</svg>

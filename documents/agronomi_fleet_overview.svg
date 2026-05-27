@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 560" role="img" aria-label="AgroNomi Fleet architecture overview">
+  <title>AgroNomi Fleet — architecture overview</title>
+  <desc>Hub computer connects via USB to a RAK4631 RNode for LoRa, and via WiFi to a local TCP listener. Five ESP32 node types reach the hub over either transport in parallel; Reticulum picks the best path automatically.</desc>
+
+  <!-- Card background -->
+  <rect width="820" height="560" rx="14" fill="#0f172a"/>
+
+  <!-- Title block -->
+  <text x="410" y="44" text-anchor="middle" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="22" font-weight="700" fill="#f1f5f9">AgroNomi Fleet</text>
+  <text x="410" y="68" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" fill="#94a3b8">LoRa + WiFi · Reticulum · end-to-end encrypted · no cloud</text>
+
+  <!-- HUB -->
+  <g>
+    <rect x="320" y="100" width="180" height="76" rx="10" fill="#0d9488" stroke="#5eead4" stroke-width="1.5"/>
+    <text x="410" y="132" text-anchor="middle" font-family="system-ui, sans-serif" font-size="15" font-weight="600" fill="#f0fdfa">AgroNomi Hub</text>
+    <text x="410" y="152" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" fill="#a7f3d0">Mac / Linux / Pi · Python</text>
+    <text x="410" y="167" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" fill="#a7f3d0">SQLite ingest · TCP :4243</text>
+  </g>
+
+  <!-- USB link to RNode -->
+  <line x1="360" y1="176" x2="220" y2="234" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="262" y="200" font-family="system-ui, sans-serif" font-size="11" font-weight="500" fill="#cbd5e1">USB</text>
+
+  <!-- WiFi link to Local TCP -->
+  <line x1="460" y1="176" x2="600" y2="234" stroke="#60a5fa" stroke-width="1.5"/>
+  <text x="540" y="200" font-family="system-ui, sans-serif" font-size="11" font-weight="500" fill="#60a5fa">WiFi LAN</text>
+
+  <!-- RNode (RAK4631) -->
+  <g>
+    <rect x="120" y="232" width="200" height="76" rx="10" fill="#b45309" stroke="#fdba74" stroke-width="1.5"/>
+    <text x="220" y="264" text-anchor="middle" font-family="system-ui, sans-serif" font-size="15" font-weight="600" fill="#fff7ed">RNode</text>
+    <text x="220" y="284" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" fill="#fed7aa">RAK4631 · stock RNode firmware</text>
+    <text x="220" y="299" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" fill="#fed7aa">LoRa 868 / 915 · BLE bridge</text>
+  </g>
+
+  <!-- Local WiFi/TCP -->
+  <g>
+    <rect x="500" y="232" width="200" height="76" rx="10" fill="#1e40af" stroke="#93c5fd" stroke-width="1.5"/>
+    <text x="600" y="264" text-anchor="middle" font-family="system-ui, sans-serif" font-size="15" font-weight="600" fill="#eff6ff">Local WiFi</text>
+    <text x="600" y="284" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" fill="#dbeafe">TCP server · mDNS / Bonjour</text>
+    <text x="600" y="299" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" fill="#dbeafe">fast OTA · real-time commands</text>
+  </g>
+
+  <!-- LoRa fan-out -->
+  <g stroke="#fb923c" stroke-width="1.5" fill="none" opacity="0.85">
+    <line x1="190" y1="308" x2="100"  y2="408"/>
+    <line x1="210" y1="308" x2="240"  y2="408"/>
+    <line x1="230" y1="308" x2="385"  y2="408"/>
+    <line x1="250" y1="308" x2="530"  y2="408"/>
+    <line x1="270" y1="308" x2="680"  y2="408"/>
+  </g>
+  <text x="220" y="350" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#fb923c">LoRa · kilometres</text>
+
+  <!-- WiFi/TCP fan-out -->
+  <g stroke="#60a5fa" stroke-width="1.5" fill="none" opacity="0.85">
+    <line x1="560" y1="308" x2="100"  y2="408"/>
+    <line x1="580" y1="308" x2="240"  y2="408"/>
+    <line x1="600" y1="308" x2="385"  y2="408"/>
+    <line x1="620" y1="308" x2="530"  y2="408"/>
+    <line x1="640" y1="308" x2="680"  y2="408"/>
+  </g>
+  <text x="600" y="350" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#60a5fa">TCP / WiFi · low latency</text>
+
+  <!-- Node row -->
+  <g font-family="system-ui, sans-serif">
+    <!-- SN-AIR -->
+    <rect x="30" y="408" width="140" height="70" rx="9" fill="#1f2937" stroke="#9ca3af" stroke-width="1"/>
+    <text x="100" y="435" text-anchor="middle" font-size="13" font-weight="600" fill="#f3f4f6">SN-AIR</text>
+    <text x="100" y="455" text-anchor="middle" font-size="10" fill="#d1d5db">air temp + humidity</text>
+    <text x="100" y="470" text-anchor="middle" font-size="9" fill="#9ca3af">deep sleep</text>
+
+    <!-- SN-SOIL -->
+    <rect x="180" y="408" width="140" height="70" rx="9" fill="#1f2937" stroke="#9ca3af" stroke-width="1"/>
+    <text x="250" y="435" text-anchor="middle" font-size="13" font-weight="600" fill="#f3f4f6">SN-SOIL</text>
+    <text x="250" y="455" text-anchor="middle" font-size="10" fill="#d1d5db">soil moisture + temp</text>
+    <text x="250" y="470" text-anchor="middle" font-size="9" fill="#9ca3af">deep sleep</text>
+
+    <!-- GW-SUPPORT -->
+    <rect x="330" y="408" width="140" height="70" rx="9" fill="#1f2937" stroke="#9ca3af" stroke-width="1"/>
+    <text x="400" y="435" text-anchor="middle" font-size="13" font-weight="600" fill="#f3f4f6">GW-SUPPORT</text>
+    <text x="400" y="455" text-anchor="middle" font-size="10" fill="#d1d5db">battery · LoRa relay</text>
+    <text x="400" y="470" text-anchor="middle" font-size="9" fill="#9ca3af">deep sleep</text>
+
+    <!-- AN-PUMP -->
+    <rect x="480" y="408" width="100" height="70" rx="9" fill="#581c87" stroke="#c4b5fd" stroke-width="1"/>
+    <text x="530" y="435" text-anchor="middle" font-size="13" font-weight="600" fill="#faf5ff">AN-PUMP</text>
+    <text x="530" y="455" text-anchor="middle" font-size="10" fill="#e9d5ff">pump relay</text>
+    <text x="530" y="470" text-anchor="middle" font-size="9" fill="#c4b5fd">always on</text>
+
+    <!-- AN-GREENHOUSE -->
+    <rect x="595" y="408" width="170" height="70" rx="9" fill="#581c87" stroke="#c4b5fd" stroke-width="1"/>
+    <text x="680" y="435" text-anchor="middle" font-size="13" font-weight="600" fill="#faf5ff">AN-GREENHOUSE</text>
+    <text x="680" y="455" text-anchor="middle" font-size="10" fill="#e9d5ff">vent · shade · fan</text>
+    <text x="680" y="470" text-anchor="middle" font-size="9" fill="#c4b5fd">always on</text>
+  </g>
+
+  <!-- Footer caption -->
+  <text x="410" y="520" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Every node speaks both transports in parallel.</text>
+  <text x="410" y="538" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#94a3b8">Reticulum picks the best available path per packet — no node-side config to switch.</text>
+
+</svg>
